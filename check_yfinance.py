@@ -102,7 +102,7 @@ def analyze_market():
                 continue
 
             cur_yield, avg_yield, z = stats
-            delta = cur_yield - avg_yield  # ← 重要
+            delta = cur_yield - avg_yield
 
             payout = info.get('payoutRatio')
             debt = info.get('totalDebt')
@@ -138,12 +138,16 @@ def analyze_market():
             # ② クオリティ・ディスカウント（修正版）
             # =========================
 
-            # ノイズ除去①：最低利回り
+            # 排他性：高配当は除外（HPQ重複防止）
+            if cur_yield > 4:
+                continue
+
+            # 最低利回り
             if cur_yield < 2:
                 continue
 
-            # ノイズ除去②：絶対差（←ここが今回の核心）
-            if delta < 0.8:
+            # 絶対差フィルタ（強化版）
+            if delta < 1.0:
                 continue
 
             # 相対乖離
