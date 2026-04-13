@@ -18,7 +18,6 @@ def get_sp500_tickers():
         response.raise_for_status()
         tables = pd.read_html(response.text)
         df = tables[0]
-        # ティッカーのドットをハイフンに変換（BRK.B -> BRK-B）
         return [t.replace('.', '-') for t in df['Symbol'].tolist()]
     except Exception as e:
         print(f"List acquisition error: {e}")
@@ -41,49 +40,13 @@ def analyze_market():
             stock = yf.Ticker(symbol)
             info = stock.info
             
-            # 基本指標の取得
-            cur_yield = info.get('dividendYield', 0) * 100
-            payout = info.get('payoutRatio', 0) * 100
-            
-            # フィルタ：利回り3%以上、配当性向80%以下、無配転落を除外
-            if cur_yield < 3.0 or payout > 80 or payout <= 0:
-                continue
-
-            # 過去2年の平均利回りとの乖離を計算
-            hist = stock.history(period="2y")
-            if hist.empty:
+            # --- 利回りの取得と正規化（バグ修正箇所） ---
+            raw_yield = info.get('dividendYield')
+            if raw_yield is None or raw_yield == 0:
                 continue
                 
-            avg_price = hist['Close'].mean()
-            annual_div = info.get('trailingAnnualDividendRate', 0)
-            avg_yield = (annual_div / avg_price) * 100 if avg_price > 0 else 0
+            # yfinanceの仕様揺れを吸収 (0.05 なら 5.0 に、5.0 ならそのままに)
+            cur_yield = raw_yield * 100 if raw_yield < 1 else raw_yield
             
-            # バグ検知：現在の利回りが過去平均より20%以上高い（＝株価急落）
-            if cur_yield > (avg_yield * 1.2):
-                found_opportunities.append({
-                    "Symbol": symbol,
-                    "Yield": cur_yield,
-                    "AvgYield": avg_yield,
-                    "Payout": payout
-                })
-        except:
-            continue
-
-    # 通知処理：利回り順にソートして上位10件
-    top_deals = sorted(found_opportunities, key=lambda x: x['Yield'], reverse=True)[:10]
-    
-    if top_deals:
-        msg = "【米国株・流動性バグ検知レポート】\n"
-        for d in top_deals:
-            msg += f"✅ **{d['Symbol']}**: 利回り{d['Yield']:.2f}% (平均{d['AvgYield']:.2f}%) / 配当性向{d['Payout']:.1f}%\n"
-        send_discord_message(msg)
-    else:
-        send_discord_message("本日、条件に合致する「バグ」銘柄は見つかりませんでした。")
-
-def send_discord_message(content):
-    payload = {"content": content}
-    headers = {"Content-Type": "application/json"}
-    requests.post(webhook_url_yfinance, data=json.dumps(payload), headers=headers)
-
-if __name__ == "__main__":
-    analyze_market()
+            # 配当性向
+            payout = info.get('payoutRatio', 0) *
