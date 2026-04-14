@@ -21,7 +21,7 @@ def get_sp500_tickers():
         return []
 
 # -----------------------------
-# 利回り統計 + 価格情報
+# 利回り統計（終値ベースのみ）
 # -----------------------------
 def calc_stats(stock, div_rate):
     hist = stock.history(period="2y")
@@ -42,15 +42,13 @@ def calc_stats(stock, div_rate):
     if std == 0 or np.isnan(std):
         return None
 
-    current_price = prices.iloc[-1]
+    latest_close = prices.iloc[-1]
     prev_close = prices.iloc[-2]
 
-    cur_yield = (div_rate / current_price) * 100
+    cur_yield = (div_rate / latest_close) * 100
     z = (cur_yield - mean) / std
 
-    change_pct = ((current_price - prev_close) / prev_close) * 100
-
-    return cur_yield, mean, z, current_price, prev_close, change_pct
+    return cur_yield, mean, z, prev_close
 
 # -----------------------------
 # FCF取得
@@ -105,7 +103,7 @@ def analyze_market():
             if not stats:
                 continue
 
-            cur_yield, avg_yield, z, current_price, prev_close, change_pct = stats
+            cur_yield, avg_yield, z, prev_close = stats
             delta = cur_yield - avg_yield
 
             payout = info.get('payoutRatio')
@@ -136,8 +134,6 @@ def analyze_market():
                     "Yield": f"{cur_yield:.2f}%",
                     "Avg": f"{avg_yield:.2f}%",
                     "Z": f"{z:.2f}",
-                    "Price": f"{current_price:.2f}",
-                    "Change": f"{change_pct:+.2f}%",
                     "PrevClose": f"{prev_close:.2f}"
                 })
 
@@ -173,8 +169,6 @@ def analyze_market():
                                     "Yield": f"{cur_yield:.2f}%",
                                     "Avg": f"{avg_yield:.2f}%",
                                     "Z": f"{z:.2f}",
-                                    "Price": f"{current_price:.2f}",
-                                    "Change": f"{change_pct:+.2f}%",
                                     "PrevClose": f"{prev_close:.2f}"
                                 })
                         else:
@@ -183,8 +177,6 @@ def analyze_market():
                                 "Yield": f"{cur_yield:.2f}%",
                                 "Avg": f"{avg_yield:.2f}%",
                                 "Z": f"{z:.2f}",
-                                "Price": f"{current_price:.2f}",
-                                "Change": f"{change_pct:+.2f}%",
                                 "PrevClose": f"{prev_close:.2f}"
                             })
 
@@ -222,9 +214,7 @@ def send_notification(income, quality):
                     {"name": "利回り", "value": d['Yield'], "inline": True},
                     {"name": "平均", "value": d['Avg'], "inline": True},
                     {"name": "Z", "value": d['Z'], "inline": True},
-                    {"name": "現在価格", "value": d['Price'], "inline": True},
-                    {"name": "前日終値", "value": d['PrevClose'], "inline": True},
-                    {"name": "変化率", "value": d['Change'], "inline": True}
+                    {"name": "前日終値", "value": d['PrevClose'], "inline": True}
                 ]
             })
 
@@ -236,9 +226,7 @@ def send_notification(income, quality):
                     {"name": "利回り", "value": d['Yield'], "inline": True},
                     {"name": "平均", "value": d['Avg'], "inline": True},
                     {"name": "Z", "value": d['Z'], "inline": True},
-                    {"name": "現在価格", "value": d['Price'], "inline": True},
-                    {"name": "前日終値", "value": d['PrevClose'], "inline": True},
-                    {"name": "変化率", "value": d['Change'], "inline": True}
+                    {"name": "前日終値", "value": d['PrevClose'], "inline": True}
                 ]
             })
 
