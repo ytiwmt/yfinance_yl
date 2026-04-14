@@ -2,10 +2,10 @@ name: US Stock Market Monitor
 
 on:
   schedule:
-    # JST 08:00 / 08:15 / 08:30（= UTC 23:00 / 23:15 / 23:30）
-    - cron: '0 23 * * 1-5'
-    - cron: '15 23 * * 1-5'
-    - cron: '30 23 * * 1-5'
+    # JST 07:47 / 08:02 / 08:17 に実行
+    - cron: '47 22 * * 1-5'
+    - cron: '2 23 * * 1-5'
+    - cron: '17 23 * * 1-5'
   workflow_dispatch:
 
 jobs:
