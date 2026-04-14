@@ -21,7 +21,7 @@ def get_sp500_tickers():
         return []
 
 # -----------------------------
-# 利回り統計（終値ベースのみ）
+# 利回り統計
 # -----------------------------
 def calc_stats(stock, div_rate):
     hist = stock.history(period="2y")
@@ -48,10 +48,12 @@ def calc_stats(stock, div_rate):
     cur_yield = (div_rate / latest_close) * 100
     z = (cur_yield - mean) / std
 
-    return cur_yield, mean, z, prev_close
+    deviation = ((cur_yield - mean) / mean) * 100
+
+    return cur_yield, mean, z, deviation, prev_close
 
 # -----------------------------
-# FCF取得
+# FCF
 # -----------------------------
 def get_fcf(stock):
     try:
@@ -85,26 +87,23 @@ def analyze_market():
 
     tickers = get_sp500_tickers()
 
-    income_dislocation = []
-    quality_discount = []
+    income = []
+    quality = []
 
     for symbol in tickers:
         try:
             stock = yf.Ticker(symbol)
             info = stock.info
 
-            price = info.get('currentPrice') or info.get('regularMarketPrice')
             div_rate = info.get('trailingAnnualDividendRate') or info.get('dividendRate')
-
-            if not price or not div_rate or div_rate <= 0:
+            if not div_rate or div_rate <= 0:
                 continue
 
             stats = calc_stats(stock, div_rate)
             if not stats:
                 continue
 
-            cur_yield, avg_yield, z, prev_close = stats
-            delta = cur_yield - avg_yield
+            cur_yield, avg_yield, z, deviation, prev_close = stats
 
             payout = info.get('payoutRatio')
             debt = info.get('totalDebt')
@@ -113,7 +112,7 @@ def analyze_market():
             fcf = get_fcf(stock)
 
             # =========================
-            # ① インカム異常
+            # インカム異常
             # =========================
             if cur_yield > 4 and z > 1.2:
 
@@ -129,25 +128,25 @@ def analyze_market():
                     if debt / ebitda > 4:
                         continue
 
-                income_dislocation.append({
+                income.append({
                     "Symbol": symbol,
                     "Yield": f"{cur_yield:.2f}%",
                     "Avg": f"{avg_yield:.2f}%",
+                    "Deviation": f"{deviation:+.1f}%",
                     "Z": f"{z:.2f}",
                     "PrevClose": f"{prev_close:.2f}"
                 })
 
             # =========================
-            # ② クオリティ・ディスカウント
+            # クオリティ・ディスカウント
             # =========================
-
             if cur_yield > 4:
                 continue
 
             if cur_yield < 2:
                 continue
 
-            if delta < 1.0:
+            if abs(cur_yield - avg_yield) < 1.0:
                 continue
 
             if avg_yield > 0:
@@ -164,18 +163,20 @@ def analyze_market():
 
                         if debt and ebitda and ebitda > 0:
                             if debt / ebitda < 3:
-                                quality_discount.append({
+                                quality.append({
                                     "Symbol": symbol,
                                     "Yield": f"{cur_yield:.2f}%",
                                     "Avg": f"{avg_yield:.2f}%",
+                                    "Deviation": f"{deviation:+.1f}%",
                                     "Z": f"{z:.2f}",
                                     "PrevClose": f"{prev_close:.2f}"
                                 })
                         else:
-                            quality_discount.append({
+                            quality.append({
                                 "Symbol": symbol,
                                 "Yield": f"{cur_yield:.2f}%",
                                 "Avg": f"{avg_yield:.2f}%",
+                                "Deviation": f"{deviation:+.1f}%",
                                 "Z": f"{z:.2f}",
                                 "PrevClose": f"{prev_close:.2f}"
                             })
@@ -183,19 +184,10 @@ def analyze_market():
         except:
             continue
 
-    income_dislocation = sorted(
-        income_dislocation,
-        key=lambda x: float(x['Yield'][:-1]),
-        reverse=True
-    )[:3]
+    income = sorted(income, key=lambda x: float(x['Yield'][:-1]), reverse=True)[:3]
+    quality = sorted(quality, key=lambda x: float(x['Z']), reverse=True)[:3]
 
-    quality_discount = sorted(
-        quality_discount,
-        key=lambda x: float(x['Z']),
-        reverse=True
-    )[:3]
-
-    send_notification(income_dislocation, quality_discount)
+    send_notification(income, quality)
 
 # -----------------------------
 # 通知
@@ -211,8 +203,12 @@ def send_notification(income, quality):
                 "title": f"🔥 インカム異常: {d['Symbol']}",
                 "color": 15158332,
                 "fields": [
-                    {"name": "利回り", "value": d['Yield'], "inline": True},
-                    {"name": "平均", "value": d['Avg'], "inline": True},
+                    {
+                        "name": "利回り",
+                        "value": f"{d['Yield']}（平均：{d['Avg']}）",
+                        "inline": False
+                    },
+                    {"name": "乖離", "value": d['Deviation'], "inline": True},
                     {"name": "Z", "value": d['Z'], "inline": True},
                     {"name": "前日終値", "value": d['PrevClose'], "inline": True}
                 ]
@@ -223,8 +219,12 @@ def send_notification(income, quality):
                 "title": f"💎 クオリティ・ディスカウント: {d['Symbol']}",
                 "color": 3447003,
                 "fields": [
-                    {"name": "利回り", "value": d['Yield'], "inline": True},
-                    {"name": "平均", "value": d['Avg'], "inline": True},
+                    {
+                        "name": "利回り",
+                        "value": f"{d['Yield']}（平均：{d['Avg']}）",
+                        "inline": False
+                    },
+                    {"name": "乖離", "value": d['Deviation'], "inline": True},
                     {"name": "Z", "value": d['Z'], "inline": True},
                     {"name": "前日終値", "value": d['PrevClose'], "inline": True}
                 ]
