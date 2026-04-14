@@ -224,7 +224,7 @@ def send_notification(income, quality):
                         "value": f"{d['Yield']}（平均：{d['Avg']}）",
                         "inline": False
                     },
-                    {"name": "乖離", "value": d['Deviation'], "inline": True},
+                    {"name": "乖離率", "value": d['Deviation'], "inline": True},
                     {"name": "Z", "value": d['Z'], "inline": True},
                     {"name": "前日終値", "value": d['PrevClose'], "inline": True}
                 ]
