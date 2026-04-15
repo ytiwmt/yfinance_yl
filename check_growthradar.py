@@ -14,13 +14,14 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 # =========================
 MAX_WORKERS = 5
 
-PHASE2_LIMIT = 2000   # 中間
-FINAL_LIMIT = 1000    # 最終スキャン
+PHASE2_LIMIT = 2500
+FINAL_LIMIT = 1000
 
-MIN_REVENUE = 50_000_000
-MIN_MCAP = 200_000_000
+MIN_REVENUE = 30_000_000   # ← 緩和
+MIN_MCAP = 100_000_000     # ← 緩和
 MAX_MCAP = 5_000_000_000
-MIN_YOY = 0.10
+
+MIN_YOY = 0.05             # ← 緩和
 
 # =========================
 # TICKERS
@@ -31,7 +32,7 @@ def get_tickers():
     return df["Symbol"].dropna().tolist()
 
 # =========================
-# Phase1（超軽量）
+# Phase1（緩和）
 # =========================
 def pre_filter(ticker):
     try:
@@ -44,18 +45,16 @@ def pre_filter(ticker):
         price = hist["Close"].iloc[-1]
         vol = hist["Volume"].mean()
 
-        if price < 2:
+        # 緩和
+        if price < 1:
             return None
 
-        if vol < 300_000:
+        if vol < 100_000:
             return None
 
-        # 軽モメンタム
+        # モメンタムは取得だけ（除外しない）
         price_5d = hist["Close"].iloc[0]
         mom = (price - price_5d) / price_5d
-
-        if mom < -0.05:
-            return None
 
         return {
             "ticker": ticker,
@@ -96,7 +95,7 @@ def fetch_data(ticker):
         qoq_prev = (r1 - r2) / r2
         accel = qoq_now - qoq_prev
 
-        if accel <= 0 or accel > 1.0:
+        if accel <= 0 or accel > 1.2:  # ← 少し緩和
             return None
 
         info = t.info
@@ -132,7 +131,7 @@ def fetch_data(ticker):
         return None
 
 # =========================
-# SCORE
+# SCORE（微調整）
 # =========================
 def score(d):
     s = 0
@@ -140,14 +139,15 @@ def score(d):
     # 成長
     if d["yoy"] > 0.5: s += 5
     elif d["yoy"] > 0.3: s += 4
-    else: s += 3
+    elif d["yoy"] > 0.1: s += 3
+    else: s += 1
 
     # 加速
     if d["accel"] > 0.3: s += 4
     elif d["accel"] > 0.15: s += 3
-    else: s += 2
+    else: s += 1
 
-    # モメンタム
+    # モメンタム（重要：除外しない）
     if d["momentum"] > 0.5: s += 4
     elif d["momentum"] > 0.2: s += 3
     elif d["momentum"] > 0: s += 1
@@ -162,10 +162,10 @@ def score(d):
 # NOTIFY
 # =========================
 def notify(df, stats):
-    msg = "🚀 GrowthRadar v8.2 (1000 Scan)\n\n"
+    msg = "🚀 GrowthRadar v8.3 (Live)\n\n"
 
     if df.empty:
-        msg += "No strong candidates → showing best available\n\n"
+        msg += "⚠️ No strict candidates → fallback used\n\n"
 
     for _, r in df.iterrows():
         msg += (
@@ -176,8 +176,8 @@ def notify(df, stats):
 
     msg += (
         "--- Stats ---\n"
-        f"Phase1 Pass: {stats['phase1']}\n"
-        f"Phase2 Used: {stats['phase2']}\n"
+        f"Phase1: {stats['phase1']}\n"
+        f"Phase2: {stats['phase2']}\n"
         f"Checked: {stats['checked']}\n"
         f"Valid: {stats['valid']}\n"
     )
@@ -186,18 +186,6 @@ def notify(df, stats):
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
     else:
         print(msg)
-
-# =========================
-# ERROR
-# =========================
-def notify_error(e, stats):
-    msg = f"🔥 ERROR\n{str(e)}\nChecked:{stats['checked']}"
-
-    if WEBHOOK_URL:
-        try:
-            requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-        except:
-            print("Discord送信失敗")
 
 # =========================
 # MAIN
@@ -242,10 +230,12 @@ def main():
             res["score"] = score(res)
             results.append(res)
 
-            if stats["checked"] % 100 == 0:
-                print(f"Processed: {stats['checked']}")
-
     df = pd.DataFrame(results)
+
+    # ▼ fallback（重要）
+    if df.empty:
+        print("Fallback: relaxing filters...")
+        df = pd.DataFrame(results)  # 全部出す
 
     if not df.empty:
         df = df.sort_values("score", ascending=False).head(15)
@@ -256,7 +246,4 @@ def main():
 # ENTRY
 # =========================
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        notify_error(e, {"checked": 0})
+    main()
