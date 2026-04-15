@@ -13,7 +13,26 @@ if not FMP_API_KEY:
 
 
 # =========================
-# STEP1: SCREENER（1 call）
+# SAFE REQUEST
+# =========================
+def safe_get(url, params=None):
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+
+        # ★ FMPエラー検出
+        if not isinstance(data, list):
+            print("API ERROR:", data)
+            return None
+
+        return data
+    except Exception as e:
+        print("REQUEST ERROR:", e)
+        return None
+
+
+# =========================
+# SCREENER（1 call）
 # =========================
 def get_candidates():
     url = "https://financialmodelingprep.com/api/v3/stock-screener"
@@ -26,63 +45,70 @@ def get_candidates():
         "apikey": FMP_API_KEY
     }
 
-    r = requests.get(url, params=params, timeout=10).json()
+    data = safe_get(url, params)
 
-    print(f"Screener fetched: {len(r)}")
+    if not data:
+        print("Screener failed")
+        return []
 
-    return r
+    print(f"Screener fetched: {len(data)}")
+    return data
 
 
 # =========================
-# STEP2: 上位抽出（構造圧縮）
+# SELECT
 # =========================
 def select_top(candidates):
+    if not candidates:
+        return []
+
     df = pd.DataFrame(candidates)
 
-    # 安全処理
+    # 必須カラムチェック
+    for col in ["marketCap", "price", "symbol"]:
+        if col not in df.columns:
+            print("Missing column:", col)
+            return []
+
     df = df.dropna(subset=["marketCap", "price"])
 
-    # 小型優先でソート
+    # 小型優先
     df = df.sort_values("marketCap")
 
-    # 上位200だけ
     df = df.head(200)
 
-    print(f"Selected for growth scan: {len(df)}")
+    print(f"Selected: {len(df)}")
 
     return df.to_dict("records")
 
 
 # =========================
-# STEP3: GROWTH取得（最大200 calls）
+# GROWTH（最大200 calls）
 # =========================
 def fetch_growth(ticker):
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
-        params = {
-            "limit": 2,
-            "apikey": FMP_API_KEY
-        }
+    url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
 
-        r = requests.get(url, params=params, timeout=5).json()
+    params = {
+        "limit": 2,
+        "apikey": FMP_API_KEY
+    }
 
-        if not isinstance(r, list) or len(r) < 2:
-            return None
+    data = safe_get(url, params)
 
-        rev1 = r[0].get("revenue", 0)
-        rev0 = r[1].get("revenue", 0)
-
-        if rev0 <= 0:
-            return None
-
-        return (rev1 - rev0) / rev0
-
-    except:
+    if not data or len(data) < 2:
         return None
+
+    rev1 = data[0].get("revenue", 0)
+    rev0 = data[1].get("revenue", 0)
+
+    if rev0 <= 0:
+        return None
+
+    return (rev1 - rev0) / rev0
 
 
 # =========================
-# SCORE v5（実戦）
+# SCORE v5
 # =========================
 def score(d):
     s = 0
@@ -100,7 +126,7 @@ def score(d):
     else:
         s += 2
 
-    # GROWTH（主軸）
+    # GROWTH
     rev = d.get("revenue_growth")
     if rev is not None:
         if rev > 0.5:
@@ -131,25 +157,30 @@ def notify(df, stats):
         print(df)
         return
 
-    if df.empty:
-        msg = "⚠️ GrowthRadar v5: No candidates"
-    else:
-        msg = "🚀 GrowthRadar v5 (Rate-Limit Safe)\n\n"
+    try:
+        if df.empty:
+            msg = "⚠️ GrowthRadar v5: No candidates\n\n"
+        else:
+            msg = "🚀 GrowthRadar v5 (Stable)\n\n"
 
-        for _, r in df.iterrows():
-            msg += (
-                f"{r['symbol']} | Score:{r['score']}\n"
-                f"MCap:{round(r['marketCap']/1e9,2)}B | Rev:{r.get('revenue_growth',0):.2f}\n\n"
-            )
+            for _, r in df.iterrows():
+                msg += (
+                    f"{r['symbol']} | Score:{r['score']}\n"
+                    f"MCap:{round(r['marketCap']/1e9,2)}B "
+                    f"| Rev:{r.get('revenue_growth',0):.2f}\n\n"
+                )
 
-    msg += (
-        "\n--- Stats ---\n"
-        f"Screener: {stats['screener']}\n"
-        f"Selected: {stats['selected']}\n"
-        f"Growth: {stats['growth']}\n"
-    )
+        msg += (
+            "--- Stats ---\n"
+            f"Screener: {stats['screener']}\n"
+            f"Selected: {stats['selected']}\n"
+            f"Growth: {stats['growth']}\n"
+        )
 
-    requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+
+    except Exception as e:
+        print("Discord error:", e)
 
 
 # =========================
@@ -162,9 +193,17 @@ def main():
     candidates = get_candidates()
     stats["screener"] = len(candidates)
 
+    if not candidates:
+        notify(pd.DataFrame(), stats)
+        return
+
     # ② Select
     selected = select_top(candidates)
     stats["selected"] = len(selected)
+
+    if not selected:
+        notify(pd.DataFrame(), stats)
+        return
 
     results = []
 
@@ -181,7 +220,9 @@ def main():
     df = pd.DataFrame(results)
 
     if not df.empty:
-        df = df[df["score"] >= 6].sort_values("score", ascending=False).head(15)
+        df = df[df["score"] >= 6] \
+            .sort_values("score", ascending=False) \
+            .head(15)
 
     notify(df, stats)
 
