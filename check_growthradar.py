@@ -18,9 +18,9 @@ if not FMP_API_KEY:
 TOP_N = 20
 MAX_WORKERS = 5
 
-MIN_MARKET_CAP = 300_000_000
-MIN_GROWTH = 0.25
-MIN_GROSS_MARGIN = 0.40
+MIN_MARKET_CAP = 200_000_000
+MIN_GROWTH = 0.10
+MIN_GROSS_MARGIN = 0.20
 
 # =========================
 # ① 母集団（安定版：FMP依存なし）
