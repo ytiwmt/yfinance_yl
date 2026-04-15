@@ -19,12 +19,10 @@ MAX_MCAP = 2_500_000_000
 MIN_PRICE = 4.0
 MIN_YOY = 0.25
 
-class GrowthRadarZeroError:
+class GrowthRadarV10_4:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0'
-        })
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
     def get_tickers(self):
         try:
@@ -56,7 +54,7 @@ class GrowthRadarZeroError:
             if len(hist) < 150: return None
             p_now = hist["Close"].iloc[-1]
             high_1y = hist["Close"].max()
-            dist_high = (high_1y - p_now) / high_1y
+            dist_high = (high_1y - p_now) / (high_1y + 1e-9)
             
             recent = hist.tail(20)
             up_vol = recent[recent['Close'] > recent['Open']]['Volume'].sum()
@@ -124,25 +122,43 @@ class GrowthRadarZeroError:
 
         df = pd.DataFrame(final_list)
         if not df.empty:
-            df = df.sort_values("score", ascending=False).head(12)
+            df = df.sort_values("score", ascending=False).head(10)
         
         self.notify(df, len(p1_results), len(final_list))
-        print("Done. Time:", round(time.time() - start_time, 1))
+        print("Completed.")
 
     def notify(self, df, s1, s2):
-        # 構文エラーを避けるため、format関数を使用し、文字列内で改行を明示的に記述
-        msg_list = []
-        msg_list.append("🚀 **GrowthRadar v10.3 Zero-Error**")
-        msg_list.append("--- 利益加速 & ブレイクアウト捕捉 ---\n")
+        # 100%構文エラーを回避するため、複数行リテラルを一切使わない記述
+        out = []
+        out.append("GrowthRadar v10.4 Ready")
+        out.append("------------------------")
         
         if df.empty:
-            msg_list.append("❌ 対象銘柄なし")
+            out.append("No candidates found.")
         else:
             for _, r in df.iterrows():
-                line1 = "**{}** | Score: **{}**".format(r['ticker'], r['score'])
-                line2 = "売上増: {:.1%} (加速: {:.1%})".format(r['yoy'], r['accel'])
-                line3 = "利幅改善: {:.1%} | 出来高質: {:.1f}".format(r['margin_boost'], r['acc_dist'])
-                line4 = "高値乖離: -{:.1%} | MCap: {:.1f}B".format(r['dist_high'], r['mcap']/1e9)
-                msg_list.append(line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n")
+                # 単一行のパーツを組み立てる
+                p_ticker = str(r['ticker'])
+                p_score = str(r['score'])
+                p_yoy = "{:.1%}".format(r['yoy'])
+                p_accel = "{:.1%}".format(r['accel'])
+                p_mcap = "{:.1f}B".format(r['mcap'] / 1e9)
+                
+                info = p_ticker + " (Score:" + p_score + ") | YoY:" + p_yoy + " (Acc:" + p_accel + ") | MCap:" + p_mcap
+                out.append(info)
 
-        msg_list.append("
+        out.append("------------------------")
+        out.append("Stats: S1=" + str(s1) + " Final=" + str(s2))
+        
+        full_msg = "\n".join(out)
+
+        if WEBHOOK_URL:
+            try:
+                requests.post(WEBHOOK_URL, json={"content": full_msg}, timeout=10)
+            except:
+                pass
+        else:
+            print(full_msg)
+
+if __name__ == "__main__":
+    GrowthRadarV10_4().run()
