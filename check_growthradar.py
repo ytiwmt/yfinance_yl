@@ -20,10 +20,9 @@ MAX_WORKERS = 5
 
 MIN_MARKET_CAP = 200_000_000
 MIN_GROWTH = 0.10
-MIN_GROSS_MARGIN = 0.20
 
 # =========================
-# ① 母集団（安定版：FMP依存なし）
+# ① 母集団（安定CSV）
 # =========================
 def get_tickers():
     url = "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
@@ -31,30 +30,27 @@ def get_tickers():
 
     tickers = df["Symbol"].dropna().tolist()
 
-    print(f"Tickers loaded: {len(tickers)}")
+    print("Tickers:", len(tickers))
     return tickers
 
 # =========================
-# ② 財務取得（FMPのみ使用）
+# ② 財務取得（欠損耐性版）
 # =========================
 def fetch_data(ticker):
     try:
-        # income statement
-        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=3&apikey={FMP_API_KEY}"
+        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=2&apikey={FMP_API_KEY}"
         fin = requests.get(url, timeout=10).json()
 
-        if not isinstance(fin, list) or len(fin) < 3:
+        if not isinstance(fin, list) or len(fin) < 2:
             return None
 
         rev0 = fin[0].get("revenue")
         rev1 = fin[1].get("revenue")
-        rev2 = fin[2].get("revenue")
 
-        if not all([rev0, rev1, rev2]):
+        if not rev0 or not rev1:
             return None
 
         yoy = (rev0 - rev1) / rev1
-        cagr = (rev0 / rev2) ** (1/2) - 1
 
         # profile
         url2 = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
@@ -63,58 +59,59 @@ def fetch_data(ticker):
         if not isinstance(prof, list) or not prof:
             return None
 
-        gross = prof[0].get("grossProfitMargin")
         mcap = prof[0].get("mktCap")
+        gross = prof[0].get("grossProfitMargin")  # optional
 
-        if gross is None or mcap is None:
+        if not mcap:
             return None
 
         return {
             "ticker": ticker,
             "yoy": yoy,
-            "cagr": cagr,
-            "gross": gross,
-            "mcap": mcap
+            "mcap": mcap,
+            "gross": gross
         }
 
     except:
         return None
 
 # =========================
-# ③ フィルタ
+# ③ フィルタ（緩め）
 # =========================
 def filter_stock(d):
     return (
         d["mcap"] >= MIN_MARKET_CAP and
-        d["yoy"] >= MIN_GROWTH and
-        d["gross"] >= MIN_GROSS_MARGIN
+        d["yoy"] >= MIN_GROWTH
     )
 
 # =========================
-# ④ スコア
+# ④ スコア（現実寄り）
 # =========================
 def score(d):
     s = 0
 
     # growth
-    if d["yoy"] > 0.6:
+    if d["yoy"] > 0.5:
         s += 5
-    elif d["yoy"] > 0.4:
+    elif d["yoy"] > 0.3:
         s += 4
-    elif d["yoy"] > 0.25:
+    elif d["yoy"] > 0.2:
         s += 3
-
-    if d["cagr"] > 0.4:
+    elif d["yoy"] > 0.1:
         s += 2
-    elif d["cagr"] > 0.25:
-        s += 1
 
-    # quality
-    if d["gross"] > 0.7:
-        s += 3
-    elif d["gross"] > 0.5:
-        s += 2
-    elif d["gross"] > 0.4:
+    # quality bonus（ある場合のみ）
+    g = d["gross"]
+    if g:
+        if g > 0.7:
+            s += 3
+        elif g > 0.5:
+            s += 2
+        elif g > 0.3:
+            s += 1
+
+    # size penalty（小型加点）
+    if d["mcap"] < 1_000_000_000:
         s += 1
 
     return s
@@ -128,11 +125,14 @@ def notify(df):
         return
 
     if df.empty:
-        msg = "No candidates"
+        msg = "No GrowthRadar candidates"
     else:
-        msg = "🚀 GrowthRadar TOP\n\n"
+        msg = "🚀 GrowthRadar v2\n\n"
         for _, r in df.iterrows():
-            msg += f"{r['Ticker']} | Score:{r['Score']}\nYoY:{r['YoY%']}% CAGR:{r['CAGR%']}%\n\n"
+            msg += (
+                f"{r['Ticker']} | Score:{r['Score']}\n"
+                f"YoY:{r['YoY%']}% | MCap:{r['MCapB']}B\n\n"
+            )
 
     requests.post(WEBHOOK_URL, json={"content": msg})
 
@@ -158,10 +158,8 @@ def main():
             results.append({
                 "Ticker": d["ticker"],
                 "YoY%": round(d["yoy"] * 100, 1),
-                "CAGR%": round(d["cagr"] * 100, 1),
-                "Gross%": round(d["gross"] * 100, 1),
-                "Score": score(d),
-                "MarketCap(B)": round(d["mcap"] / 1e9, 2)
+                "MCapB": round(d["mcap"] / 1e9, 2),
+                "Score": score(d)
             })
 
     df = pd.DataFrame(results)
@@ -174,9 +172,8 @@ def main():
     df = df.sort_values("Score", ascending=False).head(TOP_N)
 
     print(df)
-    df.to_csv("growthradar.csv", index=False)
-
     notify(df)
 
+# =========================
 if __name__ == "__main__":
     main()
