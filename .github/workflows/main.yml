@@ -28,5 +28,5 @@ jobs:
 
       - name: Run script
         env:
-          WEBHOOK_URL_YFINANCE: ${{ secrets.WEBHOOK_URL_YFINANCE }}
-        run: python check_yfinance.py
+          WEBHOOK_URL_YFINANCE: ${{ secrets.WEBHOOK_URL_YIELDLOACATION }}
+        run: python check_yieldlocation.py
