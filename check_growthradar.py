@@ -14,21 +14,32 @@ if not FMP_API_KEY:
 
 
 # =========================
-# RUSSELL 3000
+# SAFE UNIVERSE (壊れないRussell代替)
 # =========================
 def get_tickers():
-    url = "https://www.stockmarketmba.com/databases/Russell3000.csv"
+    """
+    Russell 3000代替（安定版）
+    ※外部壊れCSVを排除
+    """
+    url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
 
-    col = [c for c in df.columns if "ticker" in c.lower()][0]
-    tickers = df[col].dropna().tolist()
+    tickers = df["Symbol"].dropna().tolist()
 
-    print(f"Tickers loaded: {len(tickers)}")
+    # 少し拡張（NYSE系も混ぜる）
+    url2 = "https://datahub.io/core/nyse-other-listings/r/nyse-listed-symbols.csv"
+    df2 = pd.read_csv(url2)
+
+    tickers += df2["ACT Symbol"].dropna().tolist()
+
+    tickers = list(set(tickers))
+
+    print("Universe loaded:", len(tickers))
     return tickers
 
 
 # =========================
-# FETCH (small-cap tolerant)
+# FETCH DATA
 # =========================
 def fetch(ticker):
     try:
@@ -57,12 +68,12 @@ def fetch(ticker):
 
 
 # =========================
-# SCORE (テンバガー寄り）
+# SCORE (テンバガー寄り)
 # =========================
 def score(d):
     s = 0
 
-    # 小型ほど加点
+    # 小型ほど強く加点
     if d["mcap"] < 500_000_000:
         s += 5
     elif d["mcap"] < 1_000_000_000:
@@ -72,7 +83,7 @@ def score(d):
     else:
         s += 1
 
-    # セクター加点
+    # セクター補正
     if d["sector"] in ["Technology", "Healthcare"]:
         s += 1
 
@@ -84,13 +95,13 @@ def score(d):
 # =========================
 def notify(df):
     if not WEBHOOK_URL:
-        print("NO WEBHOOK")
+        print(df)
         return
 
     if df.empty:
         msg = "⚠️ GrowthRadar v2: No candidates"
     else:
-        msg = "🚀 GrowthRadar v2 (Russell 3000)\n\n"
+        msg = "🚀 GrowthRadar v2 (Attack Mode)\n\n"
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
@@ -100,7 +111,7 @@ def notify(df):
     try:
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
     except Exception as e:
-        print("Webhook failed:", e)
+        print("Webhook error:", e)
 
 
 # =========================
@@ -132,7 +143,6 @@ def main():
 
     df = df.sort_values("score", ascending=False).head(20)
 
-    print(df)
     notify(df)
 
 
