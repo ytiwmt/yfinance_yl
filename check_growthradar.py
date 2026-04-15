@@ -10,14 +10,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 # =========================
-# CONFIG（ここが戦略）
+# CONFIG
 # =========================
 MAX_WORKERS = 5
 SCAN_LIMIT = 300
 
-MIN_REVENUE = 50_000_000      # 最低売上（ゴミ排除）
-MIN_MCAP = 200_000_000        # 小さすぎ排除
-MAX_MCAP = 5_000_000_000      # 大型排除
+MIN_REVENUE = 50_000_000
+MIN_MCAP = 200_000_000
+MAX_MCAP = 5_000_000_000
+
+MIN_YOY = 0.10
+MIN_MOMENTUM = 0.20   # 3ヶ月 +20%
 
 # =========================
 # TICKERS
@@ -35,20 +38,16 @@ def fetch_data(ticker):
         t = yf.Ticker(ticker)
 
         # --- 財務 ---
-        df = t.quarterly_financials
-        if df is None or df.empty:
+        fin = t.quarterly_financials
+        if fin is None or fin.empty or "Total Revenue" not in fin.index:
             return None
 
-        if "Total Revenue" not in df.index:
-            return None
-
-        rev = df.loc["Total Revenue"].dropna().values
+        rev = fin.loc["Total Revenue"].dropna().values
         if len(rev) < 4:
             return None
 
         r0, r1, r2, r3 = rev[:4]
 
-        # --- 売上フィルタ ---
         if min(r0, r1, r2, r3) <= 0:
             return None
 
@@ -57,32 +56,50 @@ def fetch_data(ticker):
 
         # --- 成長 ---
         yoy = (r0 - r2) / r2
+        if yoy < MIN_YOY:
+            return None
+
         qoq_now = (r0 - r1) / r1
         qoq_prev = (r1 - r2) / r2
         accel = qoq_now - qoq_prev
 
-        # --- 異常値カット ---
-        if accel > 1.0:
-            return None
-
-        # --- 減速排除 ---
-        if accel <= 0:
+        if accel <= 0 or accel > 1.0:
             return None
 
         # --- 市場データ ---
         info = t.info
         mcap = info.get("marketCap", 0)
-
-        if not mcap:
+        if not mcap or mcap < MIN_MCAP or mcap > MAX_MCAP:
             return None
 
-        if mcap < MIN_MCAP or mcap > MAX_MCAP:
+        # --- モメンタム ---
+        hist = t.history(period="3mo")
+
+        if hist is None or hist.empty or len(hist) < 20:
             return None
+
+        price_now = hist["Close"].iloc[-1]
+        price_3m = hist["Close"].iloc[0]
+
+        momentum = (price_now - price_3m) / price_3m
+        if momentum < MIN_MOMENTUM:
+            return None
+
+        # --- 出来高 ---
+        vol_now = hist["Volume"].tail(5).mean()
+        vol_prev = hist["Volume"].head(5).mean()
+
+        if vol_prev == 0:
+            return None
+
+        vol_trend = vol_now / vol_prev
 
         return {
             "ticker": ticker,
             "yoy": yoy,
             "accel": accel,
+            "momentum": momentum,
+            "vol_trend": vol_trend,
             "mcap": mcap
         }
 
@@ -90,31 +107,29 @@ def fetch_data(ticker):
         return None
 
 # =========================
-# SCORE v7
+# SCORE v8
 # =========================
 def score(d):
     s = 0
 
-    yoy = d["yoy"]
-    accel = d["accel"]
+    # 成長
+    if d["yoy"] > 0.5: s += 5
+    elif d["yoy"] > 0.3: s += 4
+    else: s += 3
 
-    # 成長（ベース）
-    if yoy > 0.5:
-        s += 5
-    elif yoy > 0.3:
-        s += 4
-    elif yoy > 0.15:
-        s += 3
-    elif yoy > 0.05:
-        s += 1
+    # 加速
+    if d["accel"] > 0.3: s += 4
+    elif d["accel"] > 0.15: s += 3
+    else: s += 2
 
-    # 加速（主役）
-    if accel > 0.3:
-        s += 6
-    elif accel > 0.15:
-        s += 4
-    elif accel > 0.05:
-        s += 2
+    # モメンタム
+    if d["momentum"] > 0.5: s += 5
+    elif d["momentum"] > 0.3: s += 4
+    else: s += 3
+
+    # 出来高
+    if d["vol_trend"] > 1.5: s += 2
+    elif d["vol_trend"] > 1.2: s += 1
 
     return s
 
@@ -122,7 +137,7 @@ def score(d):
 # NOTIFY
 # =========================
 def notify(df, stats):
-    msg = "🚀 GrowthRadar v7 (Pro)\n\n"
+    msg = "🚀 GrowthRadar v8 (Momentum)\n\n"
 
     if df.empty:
         msg += "No candidates\n\n"
@@ -130,8 +145,8 @@ def notify(df, stats):
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
-                f"YoY:{r['yoy']:.2f} | Accel:{r['accel']:.2f} "
-                f"| MCap:{round(r['mcap']/1e9,2)}B\n\n"
+                f"YoY:{r['yoy']:.2f} Accel:{r['accel']:.2f}\n"
+                f"Mom:{r['momentum']:.2f} Vol:{r['vol_trend']:.2f}\n\n"
             )
 
     msg += (
@@ -164,7 +179,6 @@ def notify_error(e, stats):
 # =========================
 def main(stats):
     tickers = get_tickers()
-
     results = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -178,7 +192,6 @@ def main(stats):
                 continue
 
             stats["valid"] += 1
-
             res["score"] = score(res)
             results.append(res)
 
