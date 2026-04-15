@@ -25,15 +25,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas requests lxml
 
-      - name: Run yield scanner
+      - name: Run yieldlocation
         continue-on-error: true
         env:
           WEBHOOK_URL_YFINANCE: ${{ secrets.WEBHOOK_URL_YIELDLOACATION }}
         run: python check_yieldlocation.py
 
-      - name: Run growth scanner
+      - name: Run growthradar
         continue-on-error: true
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           WEBHOOK_URL_GROWTHRADAR: ${{ secrets.WEBHOOK_URL_GROWTHRADAR }}
-        run: python check_growthrader.py
+        run: python check_growthradar.py
