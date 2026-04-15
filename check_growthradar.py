@@ -7,10 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ENV
 # =========================
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 if not FMP_API_KEY:
-    raise ValueError("FMP_API_KEY is missing")
+    raise ValueError("FMP_API_KEY missing")
 
 # =========================
 # SETTINGS
@@ -18,123 +17,96 @@ if not FMP_API_KEY:
 TOP_N = 20
 MAX_WORKERS = 5
 
-MIN_MARKET_CAP = 200_000_000
-MIN_GROWTH = 0.10
+MIN_MARKET_CAP = 100_000_000  # 超重要：小型も残す
+MIN_PRICE = 1                  # ペニー除外最低限
 
 # =========================
-# ① 母集団（安定CSV）
+# ① Russell 3000（実データ）
 # =========================
 def get_tickers():
-    url = "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
+    url = "https://www.stockmarketmba.com/databases/Russell3000.csv"
     df = pd.read_csv(url)
 
-    tickers = df["Symbol"].dropna().tolist()
+    # 列名ゆれ対策
+    col = [c for c in df.columns if "ticker" in c.lower()][0]
+    tickers = df[col].dropna().tolist()
 
-    print("Tickers:", len(tickers))
+    print("Russell 3000 loaded:", len(tickers))
     return tickers
 
 # =========================
-# ② 財務取得（欠損耐性版）
+# ② 財務取得（欠損耐性MAX）
 # =========================
 def fetch_data(ticker):
     try:
-        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=2&apikey={FMP_API_KEY}"
-        fin = requests.get(url, timeout=10).json()
-
-        if not isinstance(fin, list) or len(fin) < 2:
-            return None
-
-        rev0 = fin[0].get("revenue")
-        rev1 = fin[1].get("revenue")
-
-        if not rev0 or not rev1:
-            return None
-
-        yoy = (rev0 - rev1) / rev1
-
         # profile
-        url2 = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
-        prof = requests.get(url2, timeout=10).json()
+        url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
+        prof = requests.get(url, timeout=10).json()
 
         if not isinstance(prof, list) or not prof:
             return None
 
         mcap = prof[0].get("mktCap")
-        gross = prof[0].get("grossProfitMargin")  # optional
+        price = prof[0].get("price")
+        sector = prof[0].get("sector")
 
-        if not mcap:
+        if not mcap or not price:
             return None
+
+        if mcap < MIN_MARKET_CAP or price < MIN_PRICE:
+            return None
+
+        # income statement（あればラッキー）
+        url2 = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=2&apikey={FMP_API_KEY}"
+        fin = requests.get(url2, timeout=10).json()
+
+        yoy = None
+        if isinstance(fin, list) and len(fin) >= 2:
+            r0 = fin[0].get("revenue")
+            r1 = fin[1].get("revenue")
+
+            if r0 and r1:
+                yoy = (r0 - r1) / r1
 
         return {
             "ticker": ticker,
-            "yoy": yoy,
             "mcap": mcap,
-            "gross": gross
+            "price": price,
+            "sector": sector,
+            "yoy": yoy
         }
 
     except:
         return None
 
 # =========================
-# ③ フィルタ（緩め）
-# =========================
-def filter_stock(d):
-    return (
-        d["mcap"] >= MIN_MARKET_CAP and
-        d["yoy"] >= MIN_GROWTH
-    )
-
-# =========================
-# ④ スコア（現実寄り）
+# ③ スコア（テンバガー寄り）
 # =========================
 def score(d):
     s = 0
 
-    # growth
-    if d["yoy"] > 0.5:
-        s += 5
-    elif d["yoy"] > 0.3:
-        s += 4
-    elif d["yoy"] > 0.2:
+    # growth（最重要）
+    if d["yoy"] is not None:
+        if d["yoy"] > 0.8:
+            s += 5
+        elif d["yoy"] > 0.5:
+            s += 4
+        elif d["yoy"] > 0.3:
+            s += 3
+        elif d["yoy"] > 0.1:
+            s += 2
+
+    # size（小さいほど加点）
+    if d["mcap"] < 1_000_000_000:
         s += 3
-    elif d["yoy"] > 0.1:
+    elif d["mcap"] < 5_000_000_000:
         s += 2
 
-    # quality bonus（ある場合のみ）
-    g = d["gross"]
-    if g:
-        if g > 0.7:
-            s += 3
-        elif g > 0.5:
-            s += 2
-        elif g > 0.3:
-            s += 1
-
-    # size penalty（小型加点）
-    if d["mcap"] < 1_000_000_000:
+    # sector bias（テンバガー寄り）
+    if d["sector"] in ["Technology", "Healthcare"]:
         s += 1
 
     return s
-
-# =========================
-# ⑤ Discord
-# =========================
-def notify(df):
-    if not WEBHOOK_URL:
-        print("No webhook")
-        return
-
-    if df.empty:
-        msg = "No GrowthRadar candidates"
-    else:
-        msg = "🚀 GrowthRadar v2\n\n"
-        for _, r in df.iterrows():
-            msg += (
-                f"{r['Ticker']} | Score:{r['Score']}\n"
-                f"YoY:{r['YoY%']}% | MCap:{r['MCapB']}B\n\n"
-            )
-
-    requests.post(WEBHOOK_URL, json={"content": msg})
 
 # =========================
 # MAIN
@@ -152,28 +124,26 @@ def main():
             if not d:
                 continue
 
-            if not filter_stock(d):
-                continue
+            s = score(d)
 
             results.append({
                 "Ticker": d["ticker"],
-                "YoY%": round(d["yoy"] * 100, 1),
-                "MCapB": round(d["mcap"] / 1e9, 2),
-                "Score": score(d)
+                "Score": s,
+                "YoY": None if d["yoy"] is None else round(d["yoy"] * 100, 1),
+                "MCap(B)": round(d["mcap"] / 1e9, 2),
+                "Sector": d["sector"]
             })
 
     df = pd.DataFrame(results)
 
     if df.empty:
         print("No results")
-        notify(df)
         return
 
     df = df.sort_values("Score", ascending=False).head(TOP_N)
 
     print(df)
-    notify(df)
+    df.to_csv("r3000_tenbagger.csv", index=False)
 
-# =========================
 if __name__ == "__main__":
     main()
