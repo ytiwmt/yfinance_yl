@@ -14,20 +14,20 @@ if not FMP_API_KEY:
 
 
 # =========================
-# UNIVERSE（壊れない版）
+# UNIVERSE
 # =========================
 def get_tickers():
     url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
 
     tickers = df["Symbol"].dropna().tolist()
+    print(f"Tickers loaded: {len(tickers)}")
 
-    print("Tickers loaded:", len(tickers))
     return tickers
 
 
 # =========================
-# DATA FETCH
+# FETCH
 # =========================
 def fetch(ticker):
     try:
@@ -37,11 +37,11 @@ def fetch(ticker):
         if not isinstance(r, list) or not r:
             return None
 
-        data = r[0]
+        d = r[0]
 
-        mcap = data.get("mktCap")
-        price = data.get("price")
-        sector = data.get("sector")
+        mcap = d.get("mktCap")
+        price = d.get("price")
+        sector = d.get("sector")
 
         if not mcap or not price:
             return None
@@ -58,12 +58,11 @@ def fetch(ticker):
 
 
 # =========================
-# SCORE（テンバガー寄り）
+# SCORE
 # =========================
 def score(d):
     s = 0
 
-    # 小型優遇
     if d["mcap"] < 500_000_000:
         s += 5
     elif d["mcap"] < 1_000_000_000:
@@ -73,7 +72,6 @@ def score(d):
     else:
         s += 1
 
-    # セクター加点
     if d["sector"] in ["Technology", "Healthcare"]:
         s += 1
 
@@ -81,22 +79,30 @@ def score(d):
 
 
 # =========================
-# DISCORD
+# NOTIFY
 # =========================
-def notify(df):
+def notify(df, total, processed, valid):
     if not WEBHOOK_URL:
         print(df)
         return
 
     if df.empty:
-        msg = "⚠️ GrowthRadar v2: No candidates"
+        msg = "⚠️ GrowthRadar v2: No candidates\n\n"
     else:
         msg = "🚀 GrowthRadar v2\n\n"
+
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
                 f"MCap:{r['mcap_b']}B | Sector:{r['sector']}\n\n"
             )
+
+    msg += (
+        "--------------------\n"
+        f"Total tickers: {total}\n"
+        f"Processed: {processed}\n"
+        f"Valid: {valid}\n"
+    )
 
     try:
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
@@ -110,15 +116,26 @@ def notify(df):
 def main():
     tickers = get_tickers()
 
+    total = len(tickers)
+    processed = 0
+    valid = 0
+
     results = []
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = [ex.submit(fetch, t) for t in tickers]
 
         for f in as_completed(futures):
+            processed += 1
+
+            if processed % 500 == 0:
+                print(f"Processed: {processed}/{total}")
+
             d = f.result()
             if not d:
                 continue
+
+            valid += 1
 
             d["score"] = score(d)
             d["mcap_b"] = round(d["mcap"] / 1e9, 2)
@@ -127,13 +144,10 @@ def main():
 
     df = pd.DataFrame(results)
 
-    if df.empty:
-        notify(df)
-        return
+    if not df.empty:
+        df = df.sort_values("score", ascending=False).head(20)
 
-    df = df.sort_values("score", ascending=False).head(20)
-
-    notify(df)
+    notify(df, total, processed, valid)
 
 
 if __name__ == "__main__":
