@@ -10,10 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 # =========================
-# CONFIG
+# CONFIG（ここが戦略）
 # =========================
 MAX_WORKERS = 5
-SCAN_LIMIT = 200  # API負荷回避
+SCAN_LIMIT = 300
+
+MIN_REVENUE = 50_000_000      # 最低売上（ゴミ排除）
+MIN_MCAP = 200_000_000        # 小さすぎ排除
+MAX_MCAP = 5_000_000_000      # 大型排除
 
 # =========================
 # TICKERS
@@ -21,17 +25,17 @@ SCAN_LIMIT = 200  # API負荷回避
 def get_tickers():
     url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
-    tickers = df["Symbol"].dropna().tolist()
-    return tickers[:SCAN_LIMIT]
+    return df["Symbol"].dropna().tolist()[:SCAN_LIMIT]
 
 # =========================
-# FETCH DATA（yfinance）
+# FETCH
 # =========================
-def fetch_growth(ticker):
+def fetch_data(ticker):
     try:
         t = yf.Ticker(ticker)
-        df = t.quarterly_financials
 
+        # --- 財務 ---
+        df = t.quarterly_financials
         if df is None or df.empty:
             return None
 
@@ -39,34 +43,54 @@ def fetch_growth(ticker):
             return None
 
         rev = df.loc["Total Revenue"].dropna().values
-
         if len(rev) < 4:
             return None
 
         r0, r1, r2, r3 = rev[:4]
 
+        # --- 売上フィルタ ---
         if min(r0, r1, r2, r3) <= 0:
             return None
 
-        # YoY
-        yoy = (r0 - r2) / r2
+        if r0 < MIN_REVENUE:
+            return None
 
-        # 加速
+        # --- 成長 ---
+        yoy = (r0 - r2) / r2
         qoq_now = (r0 - r1) / r1
         qoq_prev = (r1 - r2) / r2
         accel = qoq_now - qoq_prev
 
+        # --- 異常値カット ---
+        if accel > 1.0:
+            return None
+
+        # --- 減速排除 ---
+        if accel <= 0:
+            return None
+
+        # --- 市場データ ---
+        info = t.info
+        mcap = info.get("marketCap", 0)
+
+        if not mcap:
+            return None
+
+        if mcap < MIN_MCAP or mcap > MAX_MCAP:
+            return None
+
         return {
             "ticker": ticker,
             "yoy": yoy,
-            "accel": accel
+            "accel": accel,
+            "mcap": mcap
         }
 
     except:
         return None
 
 # =========================
-# SCORE
+# SCORE v7
 # =========================
 def score(d):
     s = 0
@@ -74,7 +98,7 @@ def score(d):
     yoy = d["yoy"]
     accel = d["accel"]
 
-    # 成長
+    # 成長（ベース）
     if yoy > 0.5:
         s += 5
     elif yoy > 0.3:
@@ -84,17 +108,13 @@ def score(d):
     elif yoy > 0.05:
         s += 1
 
-    # 加速（重要）
-    if accel > 0.2:
+    # 加速（主役）
+    if accel > 0.3:
         s += 6
-    elif accel > 0.1:
+    elif accel > 0.15:
         s += 4
     elif accel > 0.05:
         s += 2
-
-    # フィルタ
-    if yoy < 0.05:
-        s -= 3
 
     return s
 
@@ -102,7 +122,7 @@ def score(d):
 # NOTIFY
 # =========================
 def notify(df, stats):
-    msg = "🚀 GrowthRadar v6 (yfinance)\n\n"
+    msg = "🚀 GrowthRadar v7 (Pro)\n\n"
 
     if df.empty:
         msg += "No candidates\n\n"
@@ -110,7 +130,8 @@ def notify(df, stats):
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
-                f"YoY:{r['yoy']:.2f} | Accel:{r['accel']:.2f}\n\n"
+                f"YoY:{r['yoy']:.2f} | Accel:{r['accel']:.2f} "
+                f"| MCap:{round(r['mcap']/1e9,2)}B\n\n"
             )
 
     msg += (
@@ -147,7 +168,7 @@ def main(stats):
     results = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(fetch_growth, t): t for t in tickers}
+        futures = {ex.submit(fetch_data, t): t for t in tickers}
 
         for f in as_completed(futures):
             stats["checked"] += 1
