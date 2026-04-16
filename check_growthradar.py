@@ -8,47 +8,38 @@ import time
 from io import StringIO
 
 # =========================
-# 構成設定 (GitHub Actions 最適化)
+# CONFIG (GitHub Actions Survival Mode)
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
-# GitHub環境での安定性を考慮
-SCAN_LIMIT = 600   
-MAX_WORKERS = 2    
+SCAN_LIMIT = 500   
+MAX_WORKERS = 2    # レート制限を考慮
 
-# スクリーニング基準を「相対的」に調整
-MIN_MCAP = 50_000_000
-MAX_MCAP = 8_000_000_000
-MIN_PRICE = 1.0
-# 成長率のハードルを少し下げ、テクニカル評価を重視する
-MIN_YOY_THRESHOLD = 0.10 
-
-class GrowthRadarAgile:
+class GrowthRadarBruteForce:
     def __init__(self):
         self.session = requests.Session()
         self.agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
         ]
 
     def update_headers(self):
         self.session.headers.update({
             'User-Agent': random.choice(self.agents),
             'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://finance.yahoo.com/'
         })
 
     def get_tickers(self):
-        """監視対象銘柄の取得（コア銘柄を強化）"""
+        # 確実にヒットさせたい注目銘柄
         core_growth = [
-            "PLTR", "CELH", "RKLB", "IONQ", "HIMS", "UPST", "DUOL", "APP", 
-            "SOUN", "BROS", "MSTR", "HOOD", "NVDA", "VRT", "SMCI", "RDDT", 
-            "LUNR", "OKLO", "ASTS", "SERV", "NNE"
+            "PLTR", "NVDA", "CELH", "RKLB", "IONQ", "HIMS", "UPST", "DUOL", 
+            "APP", "SOUN", "BROS", "MSTR", "HOOD", "VRT", "SMCI", "RDDT", 
+            "LUNR", "OKLO", "ASTS", "SERV", "NNE", "TSLA", "MARA", "COIN"
         ]
         try:
             url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
-            res = self.session.get(url, timeout=10)
+            res = self.session.get(url, timeout=5)
             if res.status_code == 200:
                 df = pd.read_csv(StringIO(res.text))
                 nasdaq = df["Symbol"].dropna().tolist()
@@ -58,36 +49,34 @@ class GrowthRadarAgile:
             return core_growth
 
     def analyze(self, ticker):
-        """財務データが取れない場合でもテクニカルで加点する柔軟な解析"""
+        """極限まで条件を緩めた解析ロジック"""
         try:
             self.update_headers()
-            time.sleep(random.uniform(0.8, 1.5))
+            time.sleep(random.uniform(1.0, 2.0))
             
             t = yf.Ticker(ticker, session=self.session)
-            f = t.fast_info
             
-            # 1. 基本チェック
-            mcap = getattr(f, 'market_cap', 0)
-            if mcap < MIN_MCAP or mcap > MAX_MCAP:
+            # ヒストリカルデータ取得 (これが一番確実)
+            hist = t.history(period="6mo")
+            if hist.empty or len(hist) < 20:
                 return None
-
-            hist = t.history(period="1y")
-            if hist.empty or len(hist) < 50: return None
             
             p_now = hist["Close"].iloc[-1]
-            high_52w = hist["Close"].max()
-            # 新高値からの距離
-            dist_high = (high_52w - p_now) / (high_52w + 1e-9)
-            # 50日移動平均との乖離（トレンド強度）
-            ma50 = hist["Close"].tail(50).mean()
-            relative_strength = p_now / ma50 if ma50 > 0 else 1.0
-
-            # 2. 財務解析 (失敗しても続行)
-            yoy_growth = 0
-            accel = 0
-            has_financials = False
+            p_prev = hist["Close"].iloc[-2]
+            p_start = hist["Close"].iloc[0]
             
+            # モメンタム計算 (6ヶ月騰落率)
+            momentum = (p_now - p_start) / p_start
+            
+            # 出来高の活況度
+            vol_now = hist["Volume"].iloc[-1]
+            vol_avg = hist["Volume"].mean()
+            vol_ratio = vol_now / vol_avg if vol_avg > 0 else 1.0
+
+            # 財務データ（オプション）
+            yoy = 0
             try:
+                # 取得を試みるが、失敗しても無視
                 fin = t.quarterly_financials
                 if fin is not None and not fin.empty:
                     fin.index = fin.index.str.replace(" ", "").str.upper()
@@ -95,37 +84,28 @@ class GrowthRadarAgile:
                     if rev_key:
                         rev = fin.loc[rev_key].dropna().values
                         if len(rev) >= 2:
-                            yoy_growth = (rev[0] - rev[1]) / rev[1] if rev[1] > 0 else 0
-                            has_financials = True
-                            if len(rev) >= 3:
-                                g1 = (rev[1] - rev[2]) / rev[2] if rev[2] > 0 else 0
-                                accel = yoy_growth - g1
+                            yoy = (rev[0] - rev[1]) / rev[1] if rev[1] > 0 else 0
             except:
                 pass
 
-            # 3. スコアリング (テクニカル + 財務)
+            # スコアリング: モメンタム重視
             score = 0
-            # テクニカル評価 (最大15点)
-            if dist_high < 0.05: score += 10 # ブレイクアウト直前
-            elif dist_high < 0.15: score += 5
-            if relative_strength > 1.2: score += 5 # 強い上昇トレンド
+            if momentum > 0.5: score += 10 # 6ヶ月で50%以上上昇
+            elif momentum > 0.2: score += 5
+            
+            if vol_ratio > 1.5: score += 5 # 出来高急増
+            if yoy > 0.2: score += 10       # 20%以上の成長
+            elif yoy > 0: score += 5
 
-            # 財務評価 (最大15点)
-            if has_financials:
-                if yoy_growth > 0.3: score += 10
-                elif yoy_growth > 0.1: score += 5
-                if accel > 0: score += 5
-            else:
-                # 財務データが取れない場合はテクニカルが非常に強い場合のみ通す
-                if score < 10: return None
+            # 1日でもプラスなら生存点
+            if p_now > p_prev: score += 2
 
             return {
                 "ticker": ticker,
-                "price": p_now,
-                "mcap": mcap,
-                "yoy": yoy_growth,
-                "score": score,
-                "dist": dist_high
+                "price": round(p_now, 2),
+                "momentum": momentum,
+                "yoy": yoy,
+                "score": score
             }
         except:
             return None
@@ -136,49 +116,49 @@ class GrowthRadarAgile:
         random.shuffle(tickers)
         
         targets = tickers[:SCAN_LIMIT]
-        print(f"[*] スキャン開始: {len(targets)} 銘柄")
+        print(f"[*] 解析開始: {len(targets)} 銘柄")
         
-        final_list = []
-        # 直接解析フェーズへ（prefilterを統合して効率化）
+        results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(self.analyze, t): t for t in targets}
             for f in as_completed(futures):
                 res = f.result()
-                if res and res["score"] >= 10:
-                    final_list.append(res)
+                if res:
+                    results.append(res)
 
-        df = pd.DataFrame(final_list)
+        df = pd.DataFrame(results)
         if not df.empty:
-            # スコア順、次いで新高値に近い順
-            df = df.sort_values(["score", "dist"], ascending=[False, True]).head(12)
+            # とにかくスコアが高い順に15件出す
+            df = df.sort_values("score", ascending=False).head(15)
         
-        self.notify(df, len(targets), len(final_list))
-        print(f"[*] 完了: {time.time() - start_time:.1f}秒")
+        self.notify(df, len(targets), len(results))
+        print(f"[*] 完了: {time.time() - start_time:.1f}s")
 
-    def notify(self, df, total, hits):
+    def notify(self, df, total, valid):
         msg = []
-        msg.append("🏹 **GrowthRadar v10.7 Agile Hunter**")
+        msg.append("🚀 **GrowthRadar v10.8 Brute Force**")
         msg.append("----------------------------")
         
         if df.empty:
-            msg.append("⚠️ 現在の基準（テクニカル/財務）で合致する銘柄なし")
+            msg.append("⚠️ データ取得エラーまたは対象なし")
         else:
             for _, r in df.iterrows():
-                # 財務データがある場合のみYoYを表示
                 yoy_str = "{:.0%}".format(r['yoy']) if r['yoy'] != 0 else "N/A"
-                line = "**{}** | Score: {} | YoY: {} | High: -{:.0%}".format(
-                    r['ticker'], r['score'], yoy_str, r['dist']
+                mom_str = "{:+.0%}".format(r['momentum'])
+                line = "**{}** | Score: {} | Mom: {} | YoY: {} | ${}".format(
+                    r['ticker'], r['score'], mom_str, yoy_str, r['price']
                 )
                 msg.append(line)
 
         msg.append("----------------------------")
-        msg.append("Stats: Scanned={} | Hits={}".format(total, hits))
+        msg.append("Stats: Scanned={} | Valid_Data={}".format(total, valid))
         
         full_msg = "\n".join(msg)
         if WEBHOOK_URL:
             try: requests.post(WEBHOOK_URL, json={"content": full_msg}, timeout=15)
             except: print("Webhook Error")
-        else: print(full_msg)
+        else:
+            print(full_msg)
 
 if __name__ == "__main__":
-    GrowthRadarAgile().run()
+    GrowthRadarBruteForce().run()
