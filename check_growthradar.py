@@ -8,66 +8,55 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
-# CONFIG (v15.3 Robust Universe)
+# CONFIG (v17.0 Direct Hijack)
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-
-MAX_WORKERS = 12
-SCAN_LIMIT = 2000
-
-# ノイズ除去閾値
-MIN_PRICE = 3.0
-MIN_MARKET_CAP = 50_000_000
+MAX_WORKERS = 10
+SCAN_LIMIT = 500  # 質の高い母集団に絞る
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-class GrowthRadarV15_3:
+class GrowthRadarV17:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+        # ブラウザに完全になりすます
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"
+        })
 
     def get_universe(self):
         """
-        [修正ポイント] 
-        1つでも多くの銘柄を確実に拾うため、複数の信頼できるソースを統合。
+        [v17 核心] 
+        外部リストが死んでいるなら、Yahoo自体の『値上がり率ランキング』から
+        現在進行系で動いている母集団を直接引っこ抜く。
         """
         core = ["PLTR","NVDA","RKLB","ASTS","OKLO","HIMS","CELH","UPST","COIN","HOOD","SMCI","RDDT","LUNR","IONQ","APP","SOUN","DUOL","MSTR","TSLA","MARA"]
         
-        # 複数の信頼できる生データソース
-        sources = [
-            "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
-            "https://raw.githubusercontent.com/shilewenuw/get_all_tickers/master/get_all_tickers/tickers.csv",
-            "https://pkgstore.datahub.io/core/nasdaq-listed-symbols/nasdaq-listed-symbols_csv/data/59b09030234148646b18e03fbc5ce30f/nasdaq-listed-symbols_csv.csv"
+        scraped_tickers = []
+        # Yahoo FinanceのDay Gainers / Most Active / Trending から300-500件程度狙う
+        predefined_scanners = [
+            "day_gainers", "most_active", "trending_tickers"
         ]
         
-        ticker_pool = set(core)
-        
-        for url in sources:
+        for scrub in predefined_scanners:
             try:
-                log.info(f"Attempting to fetch from: {url}")
-                res = self.session.get(url, timeout=10)
-                if res.status_code == 200:
-                    if "csv" in url:
-                        # CSV形式のパース
-                        temp_df = pd.read_csv(requests.compat.StringIO(res.text))
-                        # Symbol, Ticker, ABBRなどカラム名のゆらぎをカバー
-                        col = next((c for c in temp_df.columns if c.lower() in ["symbol", "ticker", "abbr"]), None)
-                        if col:
-                            ticker_pool.update(temp_df[col].dropna().astype(str).tolist())
-                    else:
-                        # テキスト形式のパース
-                        ticker_pool.update([t.strip() for t in res.text.split('\n') if t.strip()])
-                
-                # 1つでも300件以上取れたら、ある程度の母集団として認める
-                if len(ticker_pool) > 300:
-                    break
+                url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&dist=200&scrIds={scrub}"
+                r = self.session.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    results = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                    tickers = [q.get("symbol") for q in results if q.get("symbol")]
+                    scraped_tickers.extend(tickers)
+                    log.info(f"Scraped {len(tickers)} symbols from {scrub}")
             except Exception as e:
-                log.warning(f"Failed to fetch {url}: {e}")
+                log.warning(f"Screener {scrub} failed: {e}")
 
-        # クレンジング
-        final_list = [t.upper() for t in ticker_pool if t.isalpha() and 1 <= len(t) <= 5]
-        random.shuffle(final_list)
+        # 重複排除 & 合体
+        total_pool = list(dict.fromkeys(core + scraped_tickers))
+        final_list = [t for t in total_pool if t and t.isalpha() and len(t) <= 5]
         
         log.info(f"Final Universe Size: {len(final_list)}")
         return final_list[:SCAN_LIMIT]
@@ -82,18 +71,18 @@ class GrowthRadarV15_3:
             meta = res.get("meta", {})
             mcap = meta.get("marketCap", 0)
             
-            # 物理フィルタ（時価総額）
-            if mcap > 0 and mcap < MIN_MARKET_CAP: return None
-
             quote = res.get("indicators", {}).get("quote", [{}])[0]
             closes = [c for c in quote.get("close", []) if c is not None]
-            
+            vols = [v for v in quote.get("volume", []) if v is not None]
+
             if len(closes) < 130: return None
 
             price = closes[-1]
-            if price < MIN_PRICE: return None
+            if price < 2.0: return None # ゴミ株排除
 
-            # 特徴量
+            # 出来高急増チェック (直近3日 avg / 20日 avg)
+            v_spike = (sum(vols[-3:]) / 3) / (sum(vols[-20:]) / 20 + 1e-9)
+
             m1 = price / closes[-20] - 1
             m3 = price / closes[-60] - 1
             m12 = price / closes[0] - 1
@@ -101,15 +90,18 @@ class GrowthRadarV15_3:
 
             return {
                 "ticker": ticker, "price": price, "mcap": mcap,
-                "m1": m1, "m3": m3, "m12": m12, "accel": accel
+                "m1": m1, "m3": m3, "m12": m12, "accel": accel, "v_spike": v_spike
             }
         except:
             return None
 
     def run(self):
         universe = self.get_universe()
+        if len(universe) < 50:
+            log.warning("Universe too small. Expanding via backup...")
+            # ここでも少なかったらもうお手上げなので、Universeを増やすための代替策を検討
+            
         results = []
-        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(self.analyze, t): t for t in universe}
             for f in as_completed(futures):
@@ -117,25 +109,27 @@ class GrowthRadarV15_3:
                 if res: results.append(res)
 
         df = pd.DataFrame(results)
-        if len(df) < 20:
-            log.warning(f"Only {len(df)} valid results. Too few for reliable Z-Score.")
-            # 統計なしでモメンタム順に出す
-            df["score"] = df["m1"] * 100 
-        else:
-            # Z-Scoreによる異常検知
-            for col in ["accel", "m1", "m3"]:
-                df[f"z_{col}"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
-            df["score"] = (df["z_accel"] * 0.5) + (df["z_m1"] * 0.3) + (df["z_m3"] * 0.2)
+        if len(df) < 15:
+            self.notify_error("Critical failure: Could not build a valid dataset.")
+            return
+
+        # Z-Score
+        for col in ["accel", "m1", "v_spike"]:
+            df[f"z_{col}"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
+        
+        # 出来高スパイクを重み付けに加える
+        df["score"] = (df["z_accel"] * 0.4) + (df["z_m1"] * 0.3) + (df["z_v_spike"] * 0.3)
 
         top = df.sort_values("score", ascending=False).head(15)
         self.notify(top, len(universe), len(df))
 
     def notify(self, df, total, valid):
-        msg = [f"🛡️ **GrowthRadar v15.3 (Anomaly Detector)**", f"Universe: {total} | Valid: {valid}\n"]
+        msg = [f"🔥 **GrowthRadar v17.0 (Screener Hijack)**", f"Universe: {total} | Analyzed: {valid}\n"]
         for r in df.to_dict("records"):
-            # 統計計算ができたかどうかで表示を変える
-            score_label = f"Score: {r['score']:.2f}" if "z_accel" in r else f"M1: {r['m1']:.1%}"
-            msg.append(f"**{r['ticker']}** | {score_label}\n└ Price: ${r['price']:.2f} | M1: {r['m1']:+.1%} | M12: {r['m12']:+.1%}")
+            msg.append(
+                f"**{r['ticker']}** | Score: {r['score']:.2f}\n"
+                f"└ Price: ${r['price']:.2f} | M1: {r['m1']:+.1%} | Vol: {r['v_spike']:.1f}x"
+            )
         
         out = "\n".join(msg)
         if WEBHOOK_URL:
@@ -143,5 +137,9 @@ class GrowthRadarV15_3:
         else:
             print(out)
 
+    def notify_error(self, err):
+        if WEBHOOK_URL:
+            requests.post(WEBHOOK_URL, json={"content": f"❌ {err}"})
+
 if __name__ == "__main__":
-    GrowthRadarV15_3().run()
+    GrowthRadarV17().run()
