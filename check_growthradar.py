@@ -6,154 +6,142 @@ import random
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import StringIO
 
 # =========================
-# 設定 (不確実性への対応)
+# CONFIG (v15.3 Robust Universe)
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
-# システムリソース・レート制限対策
-MAX_WORKERS = 10 
-SCAN_LIMIT = 2500  # 負荷分散のため
+MAX_WORKERS = 12
+SCAN_LIMIT = 2000
 
-# フィルタリング基準
-MIN_PRICE = 2.0
-MIN_MARKET_CAP = 30_000_000
-MIN_VOLUME_USD = 500_000
+# ノイズ除去閾値
+MIN_PRICE = 3.0
+MIN_MARKET_CAP = 50_000_000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-class GrowthRadarStabilized:
-    """
-    15回以上の修正を経て到達した、エラー耐性重視の分析スクリプト。
-    """
+class GrowthRadarV15_3:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
-        })
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    def get_ticker_list(self):
-        """銘柄取得の多重化（単一障害点の回避）"""
+    def get_universe(self):
+        """
+        [修正ポイント] 
+        1つでも多くの銘柄を確実に拾うため、複数の信頼できるソースを統合。
+        """
+        core = ["PLTR","NVDA","RKLB","ASTS","OKLO","HIMS","CELH","UPST","COIN","HOOD","SMCI","RDDT","LUNR","IONQ","APP","SOUN","DUOL","MSTR","TSLA","MARA"]
+        
+        # 複数の信頼できる生データソース
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
-            "https://datahub.io/core/nasdaq-listed-symbols/r/nasdaq-listed-symbols.csv"
+            "https://raw.githubusercontent.com/shilewenuw/get_all_tickers/master/get_all_tickers/tickers.csv",
+            "https://pkgstore.datahub.io/core/nasdaq-listed-symbols/nasdaq-listed-symbols_csv/data/59b09030234148646b18e03fbc5ce30f/nasdaq-listed-symbols_csv.csv"
         ]
-        # バックアップ用コア銘柄
-        core_list = ["PLTR","NVDA","RKLB","ASTS","OKLO","UPST","COIN","SMCI","RDDT","LUNR","MSTR","TSLA","VRT"]
-
+        
+        ticker_pool = set(core)
+        
         for url in sources:
             try:
-                r = self.session.get(url, timeout=10)
-                if r.status_code == 200:
-                    if ".csv" in url:
-                        df = pd.read_csv(StringIO(r.text))
-                        tickers = df["Symbol"].dropna().astype(str).tolist()
+                log.info(f"Attempting to fetch from: {url}")
+                res = self.session.get(url, timeout=10)
+                if res.status_code == 200:
+                    if "csv" in url:
+                        # CSV形式のパース
+                        temp_df = pd.read_csv(requests.compat.StringIO(res.text))
+                        # Symbol, Ticker, ABBRなどカラム名のゆらぎをカバー
+                        col = next((c for c in temp_df.columns if c.lower() in ["symbol", "ticker", "abbr"]), None)
+                        if col:
+                            ticker_pool.update(temp_df[col].dropna().astype(str).tolist())
                     else:
-                        tickers = [t.strip() for t in r.text.split('\n') if t.strip()]
-                    
-                    clean_tickers = [t for t in tickers if t.isalpha() and 1 <= len(t) <= 5]
-                    if len(clean_tickers) > 100:
-                        log.info(f"Source success: {url}")
-                        random.shuffle(clean_tickers)
-                        return list(set(core_list + clean_tickers))[:SCAN_LIMIT]
+                        # テキスト形式のパース
+                        ticker_pool.update([t.strip() for t in res.text.split('\n') if t.strip()])
+                
+                # 1つでも300件以上取れたら、ある程度の母集団として認める
+                if len(ticker_pool) > 300:
+                    break
             except Exception as e:
-                log.warning(f"Source failed {url}: {e}")
-        
-        return core_list
+                log.warning(f"Failed to fetch {url}: {e}")
 
-    def fetch_analysis(self, ticker):
-        """単一銘柄の取得とスコアリング (物理的例外のトラップ)"""
+        # クレンジング
+        final_list = [t.upper() for t in ticker_pool if t.isalpha() and 1 <= len(t) <= 5]
+        random.shuffle(final_list)
+        
+        log.info(f"Final Universe Size: {len(final_list)}")
+        return final_list[:SCAN_LIMIT]
+
+    def analyze(self, ticker):
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
         try:
-            time.sleep(random.uniform(0.05, 0.1)) # レート制限対策
             r = self.session.get(url, timeout=10)
             if r.status_code != 200: return None
             
-            data = r.json()["chart"]["result"][0]
-            meta = data.get("meta", {})
+            res = r.json()["chart"]["result"][0]
+            meta = res.get("meta", {})
             mcap = meta.get("marketCap", 0)
             
-            # 初期フィルタ
+            # 物理フィルタ（時価総額）
             if mcap > 0 and mcap < MIN_MARKET_CAP: return None
 
-            quote = data["indicators"]["quote"][0]
-            adj_close = data.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
-            closes = adj_close if adj_close else quote.get("close", [])
-            volumes = quote.get("volume", [])
-
-            # Noneの除去とデータ長チェック
-            closes = [c for c in closes if c is not None]
-            if len(closes) < 120: return None
+            quote = res.get("indicators", {}).get("quote", [{}])[0]
+            closes = [c for c in quote.get("close", []) if c is not None]
+            
+            if len(closes) < 130: return None
 
             price = closes[-1]
             if price < MIN_PRICE: return None
-            
-            # 売買代金チェック
-            avg_vol = np.mean(volumes[-5:]) if volumes else 0
-            if (price * avg_vol) < MIN_VOLUME_USD: return None
 
-            # 特徴量計算
-            returns = np.diff(np.log(closes))
+            # 特徴量
             m1 = price / closes[-20] - 1
             m3 = price / closes[-60] - 1
-            volatility = np.std(returns[-20:]) * np.sqrt(252)
+            m12 = price / closes[0] - 1
+            accel = m1 - m3
 
             return {
-                "ticker": ticker,
-                "price": price,
-                "mcap": mcap,
-                "m1": m1,
-                "m3": m3,
-                "accel": m1 - m3,
-                "vol": volatility
+                "ticker": ticker, "price": price, "mcap": mcap,
+                "m1": m1, "m3": m3, "m12": m12, "accel": accel
             }
         except:
             return None
 
     def run(self):
-        tickers = self.get_ticker_list()
-        log.info(f"Start scanning {len(tickers)} tickers...")
-
+        universe = self.get_universe()
         results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_ticker = {executor.submit(self.fetch_analysis, t): t for t in tickers}
-            for future in as_completed(future_to_ticker):
-                res = future.result()
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(self.analyze, t): t for t in universe}
+            for f in as_completed(futures):
+                res = f.result()
                 if res: results.append(res)
 
-        if len(results) < 5:
-            log.error("Insufficient data points collected.")
-            return
-
         df = pd.DataFrame(results)
-        
-        # 統計的異常値の算出 (Z-Score)
-        for col in ["accel", "m1", "m3"]:
-            df[f"z_{col}"] = (df[col] - df[col].mean()) / df[col].std()
-
-        # 総合スコア（モメンタム加速 + 順張り適性）
-        df["score"] = (df["z_accel"] * 0.5) + (df["z_m1"] * 0.3) + (df["z_m3"] * 0.2)
-        
-        top_picks = df.sort_values("score", ascending=False).head(12)
-        self.send_notification(top_picks)
-
-    def send_notification(self, df):
-        summary = [f"📊 **GrowthRadar Stability Scan** ({len(df)} picks)\n"]
-        for _, r in df.iterrows():
-            summary.append(
-                f"**{r['ticker']}** | Score: {r['score']:.2f}\n"
-                f"└ Price: ${r['price']:.2f} | M1: {r['m1']:.1%} | Accel(z): {r['z_accel']:.2f}"
-            )
-        
-        content = "\n".join(summary)
-        if WEBHOOK_URL:
-            requests.post(WEBHOOK_URL, json={"content": content})
+        if len(df) < 20:
+            log.warning(f"Only {len(df)} valid results. Too few for reliable Z-Score.")
+            # 統計なしでモメンタム順に出す
+            df["score"] = df["m1"] * 100 
         else:
-            print(content)
+            # Z-Scoreによる異常検知
+            for col in ["accel", "m1", "m3"]:
+                df[f"z_{col}"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
+            df["score"] = (df["z_accel"] * 0.5) + (df["z_m1"] * 0.3) + (df["z_m3"] * 0.2)
+
+        top = df.sort_values("score", ascending=False).head(15)
+        self.notify(top, len(universe), len(df))
+
+    def notify(self, df, total, valid):
+        msg = [f"🛡️ **GrowthRadar v15.3 (Anomaly Detector)**", f"Universe: {total} | Valid: {valid}\n"]
+        for r in df.to_dict("records"):
+            # 統計計算ができたかどうかで表示を変える
+            score_label = f"Score: {r['score']:.2f}" if "z_accel" in r else f"M1: {r['m1']:.1%}"
+            msg.append(f"**{r['ticker']}** | {score_label}\n└ Price: ${r['price']:.2f} | M1: {r['m1']:+.1%} | M12: {r['m12']:+.1%}")
+        
+        out = "\n".join(msg)
+        if WEBHOOK_URL:
+            requests.post(WEBHOOK_URL, json={"content": out})
+        else:
+            print(out)
 
 if __name__ == "__main__":
-    GrowthRadarStabilized().run()
+    GrowthRadarV15_3().run()
