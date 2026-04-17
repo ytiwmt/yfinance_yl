@@ -15,119 +15,114 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 SCAN_SIZE = 2000
 MAX_WORKERS = 10
+STATE_FILE = "growth_radar_timeseries.json"
 
 MIN_PRICE = 2.0
-MIN_MCAP = 5e7
-MIN_AVG_VOL_VAL = 5e5
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # =========================
-def send_discord(webhook_url, text):
-    if not webhook_url:
-        print("[DISCORD] missing webhook")
-        return
+# TIME SERIES STATE
+# =========================
+class TimeSeriesState:
 
-    chunks = [text[i:i+1800] for i in range(0, len(text), 1800)]
+    def __init__(self, path):
+        self.path = path
+        self.data = self._load()
 
-    for c in chunks:
-        try:
-            r = requests.post(webhook_url, json={"content": c}, timeout=10)
-            print("[DISCORD]", r.status_code)
-        except Exception as e:
-            print("[DISCORD ERROR]", e)
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def update(self, df):
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        for r in df.to_dict("records"):
+            t = r["ticker"]
+
+            if t not in self.data:
+                self.data[t] = []
+
+            self.data[t].append({
+                "date": today,
+                "momentum": float(r["momentum"]),
+                "price": float(r["price"])
+            })
+
+            # メモリ制限（直近90日）
+            self.data[t] = self.data[t][-90:]
+
+    def get_series(self, ticker):
+        return self.data.get(ticker, [])
+
+    def save(self):
+        with open(self.path, "w") as f:
+            json.dump(self.data, f)
 
 # =========================
-class GrowthRadarV26_9:
+def send(webhook, text):
+    if not webhook:
+        print(text)
+        return
+    try:
+        requests.post(webhook, json={"content": text}, timeout=10)
+    except:
+        pass
+
+# =========================
+class GrowthRadarV29:
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.state = TimeSeriesState(STATE_FILE)
 
     # =========================
     def load_universe(self):
-        symbols = []
-        sources = [
-            "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
-            "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv",
-        ]
-
-        for url in sources:
-            try:
-                r = self.session.get(url, timeout=10)
-                if r.status_code == 200:
-                    found = r.text.split("\n") if url.endswith(".txt") else pd.read_csv(url)["Symbol"].tolist()
-                    symbols.extend(found)
-            except:
-                pass
-
-        clean = list(set([
-            str(s).strip().upper()
-            for s in symbols
-            if isinstance(s, str) and re.match(r"^[A-Z]{1,5}$", str(s).strip())
-        ]))
-
+        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt"
+        r = self.session.get(url, timeout=10).text.split("\n")
+        clean = list(set([x.strip().upper() for x in r if re.match(r"^[A-Z]{1,5}$", x)]))
         random.shuffle(clean)
         return clean[:SCAN_SIZE]
 
     # =========================
-    def fetch(self, ticker):
+    def fetch(self, t):
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
             res = r["chart"]["result"][0]
 
             close = [c for c in res["indicators"]["quote"][0]["close"] if c]
             volume = [v for v in res["indicators"]["quote"][0]["volume"] if v]
 
-            if len(close) < 126:
+            if len(close) < 120:
                 return None
 
             price = close[-1]
             if price < MIN_PRICE:
                 return None
 
-            avg_vol_val = np.mean(close[-21:]) * np.mean(volume[-21:])
-            if np.isnan(avg_vol_val):
-                return None
-
             m1 = price / close[-21] - 1
             m3 = price / close[-63] - 1
-            m6 = price / close[-126] - 1
+            m6 = price / close[-120] - 1
 
             trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
 
-            # =========================
-            # SURVIVAL SCORE（重要）
-            # =========================
-
-            vol_mean = np.mean(volume[-21:])
-            vol_std = np.std(volume[-21:]) + 1e-9
-
-            volatility = np.std(close[-21:]) / np.mean(close[-21:])
-
-            survival = (
-                np.log1p(vol_mean) * 0.4 +
-                (1 / vol_std) * 0.2 +
-                (1 - min(volatility, 1)) * 0.4
-            )
-
-            # 生存最低条件（消さないための緩いゲート）
-            if survival < 0.5:
-                return None
+            accel = m1 - m3
 
             return {
-                "ticker": ticker,
+                "ticker": t,
                 "price": price,
-                "m6": m6,
                 "m1": m1,
                 "m3": m3,
-                "accel": m1 - m3,
+                "m6": m6,
                 "trend": trend,
-                "survival": survival,
-                "vol_short": np.mean(volume[-5:]),
-                "vol_mid": np.mean(volume[-21:]),
-                "vol_long": np.mean(volume[-63:])
+                "accel": accel,
+                "vol": np.mean(volume[-21:])
             }
 
         except:
@@ -136,36 +131,45 @@ class GrowthRadarV26_9:
     # =========================
     def score(self, df):
 
-        df["vol_ratio"] = df["vol_short"] / (df["vol_mid"] + 1e-9)
-
-        # MOMENTUM SCORE（従来）
         df["momentum"] = (
-            df["m6"].rank(pct=True) * 0.40 +
-            df["accel"].rank(pct=True) * 0.20 +
-            df["trend"].rank(pct=True) * 0.25 +
-            df["vol_ratio"].rank(pct=True) * 0.15
-        )
-
-        # SURVIVAL SCORE（正規化）
-        df["survival_score"] = df["survival"].rank(pct=True)
-
-        # FINAL SCORE（両軸統合）
-        df["score"] = (
-            df["momentum"] * 0.7 +
-            df["survival_score"] * 0.3
+            df["m6"].rank(pct=True) * 0.35 +
+            df["accel"].rank(pct=True) * 0.35 +
+            df["trend"].rank(pct=True) * 0.30
         )
 
         return df
 
     # =========================
+    def detect_reentry(self, df):
+
+        reentry = []
+
+        for r in df.to_dict("records"):
+            series = self.state.get_series(r["ticker"])
+
+            if len(series) < 5:
+                continue
+
+            # slope（直近5日トレンド）
+            recent = [x["momentum"] for x in series[-5:]]
+            slope = recent[-1] - recent[0]
+
+            prev_slope = series[-2]["momentum"] - series[-5]["momentum"]
+
+            # “沈んでから再上昇”
+            if prev_slope < 0 and slope > 0.15 and r["momentum"] > 0.75:
+                reentry.append(r)
+
+        return reentry
+
+    # =========================
     def run(self):
 
         universe = self.load_universe()
-        batch = universe[:SCAN_SIZE]
 
         raw = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(self.fetch, t): t for t in batch}
+            futures = {ex.submit(self.fetch, t): t for t in universe}
             for f in as_completed(futures):
                 r = f.result()
                 if r:
@@ -175,37 +179,42 @@ class GrowthRadarV26_9:
             print("NO DATA")
             return
 
-        df = self.score(pd.DataFrame(raw)).sort_values("score", ascending=False)
+        df = self.score(pd.DataFrame(raw)).sort_values("momentum", ascending=False)
 
-        tier1 = df[df["score"] > 0.80]
-        tier2 = df[(df["score"] <= 0.80) & (df["score"] > 0.60)]
+        tier1 = df[df["momentum"] > 0.85]
+        tier2 = df[(df["momentum"] <= 0.85) & (df["momentum"] > 0.7)]
+
+        reentry = self.detect_reentry(df)
+
+        # STATE UPDATE（時系列）
+        self.state.update(df)
+        self.state.save()
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            "🚀 GrowthRadar v26.9 (Survival Score)",
-            f"Live:{len(df)} Tier1:{len(tier1)} Tier2:{len(tier2)} {now}\n",
+            "📈 GrowthRadar v29 (Time-Series Engine)",
+            f"Live:{len(df)} Tier1:{len(tier1)} Tier2:{len(tier2)} ReEntry:{len(reentry)} {now}\n",
             "🔥 Tier1"
         ]
 
-        for r in tier1.head(8).to_dict("records"):
-            msg.append(
-                f"{r['ticker']} S:{r['score']:.2f} "
-                f"(M:{r['momentum']:.2f} S:{r['survival']:.2f})"
-            )
+        for r in tier1.head(10).to_dict("records"):
+            msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
 
         msg.append("\n👀 Tier2")
-        for r in tier2.head(8).to_dict("records"):
-            msg.append(
-                f"{r['ticker']} S:{r['score']:.2f} "
-                f"(M:{r['momentum']:.2f} S:{r['survival']:.2f})"
-            )
+        for r in tier2.head(10).to_dict("records"):
+            msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
+
+        if reentry:
+            msg.append("\n♻️ Re-Entry (Slope Break)")
+            for r in reentry[:8]:
+                msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
 
         text = "\n".join(msg)
 
         print(text)
-        send_discord(WEBHOOK_URL, text)
+        send(WEBHOOK_URL, text)
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_9().run()
+    GrowthRadarV29().run()
