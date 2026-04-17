@@ -2,8 +2,11 @@ import os, requests, pandas as pd, numpy as np, random, re, json, time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# =========================
+# CONFIG
+# =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-STATE_FILE = "growth_state_v32_2.json"
+STATE_FILE = "growth_state_v32_3.json"
 SCAN_SIZE = 1500
 MAX_WORKERS = 10
 MIN_PRICE = 2.0
@@ -38,7 +41,7 @@ class State:
         self.data[ticker] = hist[-30:]
 
 # =========================
-# UNIVERSE（安定）
+# UNIVERSE（冗長化）
 # =========================
 def load_universe():
     symbols = []
@@ -99,7 +102,6 @@ def fetch(session, ticker):
 
         accel = m1 - (m3 / 3)
 
-        # 加速重視
         score = (0.3 * m6) + (0.3 * trend) + (0.4 * accel)
 
         return {"ticker": ticker, "score": score, "price": price}
@@ -108,57 +110,67 @@ def fetch(session, ticker):
         return None
 
 # =========================
-# DETECTOR（初期対応）
+# DETECTOR（EARLY + 厳選EXPANSION）
 # =========================
 def detect(state):
-    results = []
+    early = []
+    expansion = []
 
     for t, hist in state.data.items():
-        if len(hist) < 5:   # ← 初期対応で緩和
+        if len(hist) < 5:
             continue
 
         scores = [h["s"] for h in hist]
         latest = scores[-1]
         avg = np.mean(scores)
+        growth = latest - scores[0]
 
-        # ★ コア条件（超重要）
-        if latest > avg:
+        # -----------------
+        # EARLY（初動）
+        # -----------------
+        if latest > avg and growth > 0.02:
+            early.append({
+                "ticker": t,
+                "score": latest,
+                "growth": growth
+            })
 
-            # ノイズ排除（微上昇は除く）
-            growth = (latest - scores[0]) if len(scores) > 1 else 0
+        # -----------------
+        # EXPANSION（厳選）
+        # -----------------
+        if latest > 0.85 and avg > 0.65 and growth > 0.05:
+            expansion.append({
+                "ticker": t,
+                "score": latest,
+                "growth": growth
+            })
 
-            if growth > 0.02:  # ← 調整可能（0.01〜0.05）
-                results.append({
-                    "ticker": t,
-                    "score": latest,
-                    "growth": growth
-                })
+    early = sorted(early, key=lambda x: x["score"], reverse=True)
+    expansion = sorted(expansion, key=lambda x: x["score"], reverse=True)
 
-    return sorted(results, key=lambda x: x["score"], reverse=True)
+    return early, expansion
 
 # =========================
 # REPORT
 # =========================
-def report(candidates, scanned, valid):
+def report(early, expansion, scanned, valid):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = [
-        f"🚀 GrowthRadar v32.2",
-        f"Scanned:{scanned} Valid:{valid} Candidates:{len(candidates)}",
+        f"🚀 GrowthRadar v32.3",
+        f"Scanned:{scanned} Valid:{valid}",
+        f"EARLY:{len(early)} EXPANSION:{len(expansion)}",
         f"Time:{now}",
         ""
     ]
 
-    if candidates:
-        msg.append("🔥 EARLY MOMENTUM")
-        for c in candidates[:10]:
-            msg.append(
-                f"{c['ticker']} "
-                f"S:{c['score']:.2f} "
-                f"Growth:{c['growth']:.3f}"
-            )
-    else:
-        msg.append("⚠️ NO CANDIDATES (very early or flat market)")
+    msg.append("🔥 EARLY (初動)")
+    for c in early[:5]:
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
+
+    msg.append("\n🚀 EXPANSION (本命)")
+    for c in expansion[:10]:
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
 
     text = "\n".join(msg)
     print(text)
@@ -189,13 +201,24 @@ def run():
             res = f.result()
             if res:
                 raw.append(res)
-                state.update(res["ticker"], res["score"])
+
+    if not raw:
+        print("NO DATA")
+        return
+
+    # ★ 重要：スコアをランキング化（これが効く）
+    df = pd.DataFrame(raw)
+    df["score"] = df["score"].rank(pct=True)
+
+    # state更新
+    for _, r in df.iterrows():
+        state.update(r["ticker"], r["score"])
 
     state.save()
 
-    candidates = detect(state)
+    early, expansion = detect(state)
 
-    report(candidates, len(universe), len(raw))
+    report(early, expansion, len(universe), len(df))
 
 
 if __name__ == "__main__":
