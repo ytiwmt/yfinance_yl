@@ -15,34 +15,40 @@ from datetime import datetime
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 MAX_WORKERS = 10
-SCAN_SIZE = 2000   # ← 少し拡張
+SCAN_SIZE = 2000
+
+STATE_FILE = "state_store_v26_6.json"
+
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
 MIN_AVG_VOL_VAL = 5e5
-
-UNIVERSE_FILE = "universe_v26_5.json"
-LOG_FILE = "growthradar_v26_5.log"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json"
 }
 
-class GrowthRadarV26_5_1:
+# =========================
+# STATE STORE
+# =========================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+# =========================
+class GrowthRadarV26_6:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
     # =========================
-    # UNIVERSE
-    # =========================
     def load_universe(self):
-        if os.path.exists(UNIVERSE_FILE):
-            with open(UNIVERSE_FILE, "r") as f:
-                return json.load(f)
-
-        print("Creating universe...")
-
         symbols = []
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
@@ -69,24 +75,14 @@ class GrowthRadarV26_5_1:
         ]))
 
         random.shuffle(clean)
-        core = clean[:3000]
+        return clean[:3000]
 
-        with open(UNIVERSE_FILE, "w") as f:
-            json.dump(core, f)
-
-        return core
-
-    # =========================
-    # FETCH
     # =========================
     def fetch(self, ticker):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
             res = r["chart"]["result"][0]
-
-            if (time.time() - res["meta"].get("regularMarketTime", 0)) > 86400 * 5:
-                return None
 
             close = [c for c in res["indicators"]["quote"][0]["close"] if c]
             volume = [v for v in res["indicators"]["quote"][0]["volume"] if v]
@@ -109,16 +105,14 @@ class GrowthRadarV26_5_1:
             if m6 < 0.3 or m1 > 1.5:
                 return None
 
-            volat = np.std(close[-21:]) / np.mean(close[-21:])
-            if volat > 0.25:
-                return None
+            trend = np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1
 
             return {
                 "ticker": ticker,
                 "price": price,
                 "m6": m6,
                 "accel": m1 - m3,
-                "trend": np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1,
+                "trend": trend,
                 "vol_short": np.mean(volume[-5:]),
                 "vol_mid": np.mean(volume[-21:]),
                 "vol_long": np.mean(volume[-63:])
@@ -128,40 +122,76 @@ class GrowthRadarV26_5_1:
             return None
 
     # =========================
-    # META
-    # =========================
-    def fetch_meta(self, tickers):
-        meta = {}
-        try:
-            for i in range(0, len(tickers), 100):
-                chunk = tickers[i:i+100]
-                url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={','.join(chunk)}"
-                r = self.session.get(url, timeout=10).json()
+    def compute_score(self, df):
+        df["vol_ratio"] = df["vol_short"] / (df["vol_mid"] + 1e-9)
 
-                for res in r.get("quoteResponse", {}).get("result", []):
-                    meta[res["symbol"]] = {
-                        "name": res.get("longName", res.get("shortName", res["symbol"])),
-                        "mcap": res.get("marketCap", 0)
-                    }
-        except:
-            pass
-        return meta
+        raw_score = (
+            df["m6"].rank(pct=True) * 0.40 +
+            df["accel"].rank(pct=True) * 0.20 +
+            df["trend"].rank(pct=True) * 0.25 +
+            df["vol_ratio"].rank(pct=True) * 0.15
+        )
+
+        df["raw_score"] = raw_score
+        return df
 
     # =========================
-    # LOG
-    # =========================
-    def log(self, text):
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"\n\n[{datetime.now()}]\n{text}")
+    def update_state(self, df, state):
+        now = datetime.now().strftime("%Y-%m-%d")
+
+        for _, r in df.iterrows():
+            t = r["ticker"]
+
+            if t not in state:
+                state[t] = {
+                    "history": []
+                }
+
+            state[t]["history"].append({
+                "date": now,
+                "score": float(r["raw_score"]),
+                "trend": float(r["trend"]),
+                "m6": float(r["m6"])
+            })
+
+            # 最新10日だけ保持
+            state[t]["history"] = state[t]["history"][-10:]
+
+        return state
 
     # =========================
-    # RUN
+    def state_score(self, state):
+        rows = []
+
+        for t, s in state.items():
+            hist = s["history"]
+            if len(hist) < 3:
+                continue
+
+            scores = [h["score"] for h in hist]
+            trends = [h["trend"] for h in hist]
+
+            state_score = (
+                np.mean(scores) * 0.7 +
+                np.max(scores) * 0.3
+            )
+
+            stability = 1 - np.std(scores)
+
+            rows.append({
+                "ticker": t,
+                "state_score": state_score,
+                "stability": stability,
+                "last_score": scores[-1],
+                "trend": trends[-1]
+            })
+
+        return pd.DataFrame(rows)
+
     # =========================
     def run(self):
         universe = self.load_universe()
         batch = universe[:SCAN_SIZE]
-
-        print(f"Scanning {len(batch)} symbols...")
 
         raw = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -172,78 +202,49 @@ class GrowthRadarV26_5_1:
                     raw.append(r)
 
         if not raw:
-            print("No candidates.")
+            print("No data")
             return
 
-        meta = self.fetch_meta([r["ticker"] for r in raw])
+        df = pd.DataFrame(raw)
+        df = self.compute_score(df)
 
-        data = []
-        for r in raw:
-            m = meta.get(r["ticker"], {"name": r["ticker"], "mcap": 0})
-            if 0 < m["mcap"] < MIN_MCAP:
-                continue
-            r.update(m)
-            data.append(r)
+        state = load_state()
+        state = self.update_state(df, state)
+        save_state(state)
 
-        df = pd.DataFrame(data)
-        if df.empty:
+        st_df = self.state_score(state)
+
+        if st_df.empty:
             return
 
-        # =========================
-        # Tier1（不変）
-        # =========================
-        df_t1 = df[
-            (df["accel"] >= 0.20) &
-            (df["trend"] >= 0.20) &
-            (df["vol_mid"] >= df["vol_long"] * 1.3) &
-            (df["vol_short"] >= df["vol_mid"] * 0.9)
-        ].copy()
+        # フィルタ（状態保持型）
+        t1 = st_df[
+            (st_df["state_score"] > 0.7) &
+            (st_df["stability"] > 0.2)
+        ].sort_values("state_score", ascending=False)
 
-        # =========================
-        # Tier2（軽微緩和）
-        # =========================
-        df_t2 = df[
-            (df["accel"] >= 0.16) &          # ← 0.18 → 0.16
-            (df["trend"] >= 0.12) &          # ← 0.15 → 0.12
-            (df["vol_mid"] >= df["vol_long"] * 1.05)  # ← 緩和
-        ].copy()
+        t2 = st_df[
+            (st_df["state_score"] > 0.5)
+        ].sort_values("state_score", ascending=False)
 
-        def score(d):
-            if d.empty:
-                return d
-            d["vol_ratio"] = d["vol_short"] / (d["vol_mid"] + 1e-9)
-            d["score"] = (
-                d["m6"].rank(pct=True) * 0.40 +
-                d["accel"].rank(pct=True) * 0.20 +
-                d["trend"].rank(pct=True) * 0.25 +
-                d["vol_ratio"].rank(pct=True) * 0.15
-            )
-            return d.sort_values("score", ascending=False)
-
-        t1 = score(df_t1)
-        t2 = score(df_t2)
-
-        output = self.report(t1, t2, len(batch), len(df))
-        self.log(output)
+        self.report(t1, t2)
 
     # =========================
-    # REPORT
-    # =========================
-    def report(self, t1, t2, scanned, base):
+    def report(self, t1, t2):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.5.1 (Balanced)",
-            f"Scanned:{scanned} | Base:{base} | Tier1:{len(t1)} | Tier2:{len(t2)} | {now}\n"
+            f"🚀 GrowthRadar v26.6 (State-Aware)",
+            f"Tier1:{len(t1)} | Tier2:{len(t2)} | {now}\n"
         ]
 
-        msg.append("🏆 Tier1")
+        msg.append("🏆 Tier1 (Persistent)")
         for r in t1.head(10).to_dict("records"):
-            msg.append(f"{r['ticker']} | S:{r['score']:.2f} | P:${r['price']:.2f}")
+            msg.append(f"{r['ticker']} | S:{r['state_score']:.2f} | ST:{r['stability']:.2f}")
 
-        msg.append("\n👀 Tier2")
+        msg.append("\n👀 Tier2 (Tracking)")
         for r in t2.head(10).to_dict("records"):
-            msg.append(f"{r['ticker']} | S:{r['score']:.2f} | P:${r['price']:.2f}")
+            msg.append(f"{r['ticker']} | S:{r['state_score']:.2f}")
 
         text = "\n".join(msg)
 
@@ -251,8 +252,7 @@ class GrowthRadarV26_5_1:
             requests.post(WEBHOOK_URL, json={"content": text})
 
         print(text)
-        return text
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_5_1().run()
+    GrowthRadarV26_6().run()
