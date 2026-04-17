@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIG
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-STATE_FILE = "growth_state_v32_3.json"
+STATE_FILE = "growth_state_v32_4.json"
 SCAN_SIZE = 1500
 MAX_WORKERS = 10
 MIN_PRICE = 2.0
@@ -41,7 +41,7 @@ class State:
         self.data[ticker] = hist[-30:]
 
 # =========================
-# UNIVERSE（冗長化）
+# UNIVERSE
 # =========================
 def load_universe():
     symbols = []
@@ -110,11 +110,12 @@ def fetch(session, ticker):
         return None
 
 # =========================
-# DETECTOR（EARLY + 厳選EXPANSION）
+# DETECTOR（現実版）
 # =========================
 def detect(state):
     early = []
     expansion = []
+    expansion_strict = []
 
     for t, hist in state.data.items():
         if len(hist) < 5:
@@ -126,9 +127,9 @@ def detect(state):
         growth = latest - scores[0]
 
         # -----------------
-        # EARLY（初動）
+        # EARLY（初動：とにかく拾う）
         # -----------------
-        if latest > avg and growth > 0.02:
+        if growth > 0.04:
             early.append({
                 "ticker": t,
                 "score": latest,
@@ -136,40 +137,55 @@ def detect(state):
             })
 
         # -----------------
-        # EXPANSION（厳選）
+        # EXPANSION（中核）
         # -----------------
-        if latest > 0.85 and avg > 0.65 and growth > 0.05:
+        if latest > 0.70 and avg > 0.55 and growth > 0.03:
             expansion.append({
                 "ticker": t,
                 "score": latest,
                 "growth": growth
             })
 
-    early = sorted(early, key=lambda x: x["score"], reverse=True)
-    expansion = sorted(expansion, key=lambda x: x["score"], reverse=True)
+        # -----------------
+        # STRONG（本命）
+        # -----------------
+        if latest > 0.85 and avg > 0.65 and growth > 0.05:
+            expansion_strict.append({
+                "ticker": t,
+                "score": latest,
+                "growth": growth
+            })
 
-    return early, expansion
+    early = sorted(early, key=lambda x: x["growth"], reverse=True)
+    expansion = sorted(expansion, key=lambda x: x["score"], reverse=True)
+    expansion_strict = sorted(expansion_strict, key=lambda x: x["score"], reverse=True)
+
+    return early, expansion, expansion_strict
 
 # =========================
 # REPORT
 # =========================
-def report(early, expansion, scanned, valid):
+def report(early, expansion, expansion_strict, scanned, valid):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = [
-        f"🚀 GrowthRadar v32.3",
+        f"🚀 GrowthRadar v32.4",
         f"Scanned:{scanned} Valid:{valid}",
-        f"EARLY:{len(early)} EXPANSION:{len(expansion)}",
+        f"EARLY:{len(early)} EXP:{len(expansion)} STRONG:{len(expansion_strict)}",
         f"Time:{now}",
         ""
     ]
 
     msg.append("🔥 EARLY (初動)")
-    for c in early[:5]:
+    for c in early[:10]:
         msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
 
-    msg.append("\n🚀 EXPANSION (本命)")
+    msg.append("\n🚀 EXPANSION (中核)")
     for c in expansion[:10]:
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
+
+    msg.append("\n💎 STRONG (本命)")
+    for c in expansion_strict[:5]:
         msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
 
     text = "\n".join(msg)
@@ -177,10 +193,9 @@ def report(early, expansion, scanned, valid):
 
     if WEBHOOK_URL:
         try:
-            res = requests.post(WEBHOOK_URL, json={"content": text[:1900]})
-            print(f"[WEBHOOK] {res.status_code}")
-        except Exception as e:
-            print(f"[WEBHOOK ERROR] {e}")
+            requests.post(WEBHOOK_URL, json={"content": text[:1900]})
+        except:
+            pass
 
 # =========================
 # MAIN
@@ -206,7 +221,7 @@ def run():
         print("NO DATA")
         return
 
-    # ★ 重要：スコアをランキング化（これが効く）
+    # スコアをランキング化（相対強度）
     df = pd.DataFrame(raw)
     df["score"] = df["score"].rank(pct=True)
 
@@ -216,9 +231,9 @@ def run():
 
     state.save()
 
-    early, expansion = detect(state)
+    early, expansion, expansion_strict = detect(state)
 
-    report(early, expansion, len(universe), len(df))
+    report(early, expansion, expansion_strict, len(universe), len(df))
 
 
 if __name__ == "__main__":
