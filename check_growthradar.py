@@ -5,11 +5,12 @@ import numpy as np
 import random
 import re
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =========================
-# CONFIG (v26.4+)
+# CONFIG
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
@@ -18,22 +19,31 @@ SCAN_SIZE = 1500
 
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
-MIN_AVG_VOL_VAL = 5e5  # $500k/day
+MIN_AVG_VOL_VAL = 5e5
+
+UNIVERSE_FILE = "universe_v26_5.json"
+LOG_FILE = "growthradar_v26_5.log"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json"
 }
 
-class GrowthRadarV26_4_Plus:
+class GrowthRadarV26_5:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
     # =========================
-    # UNIVERSE
+    # UNIVERSE (fixed)
     # =========================
     def load_universe(self):
+        if os.path.exists(UNIVERSE_FILE):
+            with open(UNIVERSE_FILE, "r") as f:
+                return json.load(f)
+
+        print("Creating universe...")
+
         symbols = []
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
@@ -60,10 +70,17 @@ class GrowthRadarV26_4_Plus:
         ]))
 
         random.shuffle(clean)
-        return clean
+
+        # 固定コアユニバース
+        core = clean[:3000]
+
+        with open(UNIVERSE_FILE, "w") as f:
+            json.dump(core, f)
+
+        return core
 
     # =========================
-    # FETCH
+    # FETCH TECHNICAL
     # =========================
     def fetch(self, ticker):
         try:
@@ -71,7 +88,6 @@ class GrowthRadarV26_4_Plus:
             r = self.session.get(url, timeout=6).json()
             res = r["chart"]["result"][0]
 
-            # ゾンビ排除
             if (time.time() - res["meta"].get("regularMarketTime", 0)) > 86400 * 5:
                 return None
 
@@ -85,12 +101,10 @@ class GrowthRadarV26_4_Plus:
             if price < MIN_PRICE:
                 return None
 
-            # 流動性
             avg_vol_val = np.mean(close[-21:]) * np.mean(volume[-21:])
             if avg_vol_val < MIN_AVG_VOL_VAL:
                 return None
 
-            # リターン
             m1 = price / close[-21] - 1
             m3 = price / close[-63] - 1
             m6 = price / close[-126] - 1
@@ -137,6 +151,13 @@ class GrowthRadarV26_4_Plus:
         return meta
 
     # =========================
+    # LOG
+    # =========================
+    def log(self, text):
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n\n[{datetime.now()}]\n{text}")
+
+    # =========================
     # RUN
     # =========================
     def run(self):
@@ -169,25 +190,20 @@ class GrowthRadarV26_4_Plus:
 
         df = pd.DataFrame(data)
         if df.empty:
-            print("No valid after meta.")
             return
 
-        # =========================
-        # Tier1（厳格）
-        # =========================
-        df_strict = df[
+        # Tier1
+        df_t1 = df[
             (df["accel"] >= 0.20) &
             (df["trend"] >= 0.20) &
             (df["vol_mid"] >= df["vol_long"] * 1.3) &
             (df["vol_short"] >= df["vol_mid"] * 0.9)
         ].copy()
 
-        # =========================
-        # Tier2（最適化版）
-        # =========================
-        df_loose = df[
-            (df["accel"] >= 0.18) &          # ← 微強化
-            (df["trend"] >= 0.15) &          # ← 本質修正
+        # Tier2
+        df_t2 = df[
+            (df["accel"] >= 0.18) &
+            (df["trend"] >= 0.15) &
             (df["vol_mid"] >= df["vol_long"] * 1.1)
         ].copy()
 
@@ -195,7 +211,6 @@ class GrowthRadarV26_4_Plus:
             if d.empty:
                 return d
             d["vol_ratio"] = d["vol_short"] / (d["vol_mid"] + 1e-9)
-
             d["score"] = (
                 d["m6"].rank(pct=True) * 0.40 +
                 d["accel"].rank(pct=True) * 0.20 +
@@ -204,10 +219,12 @@ class GrowthRadarV26_4_Plus:
             )
             return d.sort_values("score", ascending=False)
 
-        t1 = score(df_strict)
-        t2 = score(df_loose)
+        t1 = score(df_t1)
+        t2 = score(df_t2)
 
-        self.report(t1, t2, len(batch), len(df))
+        output = self.report(t1, t2, len(batch), len(df))
+
+        self.log(output)
 
     # =========================
     # REPORT
@@ -216,23 +233,17 @@ class GrowthRadarV26_4_Plus:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.4+",
+            f"🚀 GrowthRadar v26.5 (Tracking Engine)",
             f"Scanned:{scanned} | Base:{base} | Tier1:{len(t1)} | Tier2:{len(t2)} | {now}\n"
         ]
 
-        msg.append("🏆 Tier1 (High Conviction)\n")
+        msg.append("🏆 Tier1")
         for r in t1.head(10).to_dict("records"):
-            msg.append(
-                f"{r['ticker']} | S:{r['score']:.2f} | "
-                f"P:${r['price']:.2f} | M6:{r['m6']:+.0%} | T:{r['trend']:.2f}"
-            )
+            msg.append(f"{r['ticker']} | S:{r['score']:.2f} | P:${r['price']:.2f}")
 
-        msg.append("\n👀 Tier2 (Watchlist)\n")
+        msg.append("\n👀 Tier2")
         for r in t2.head(10).to_dict("records"):
-            msg.append(
-                f"{r['ticker']} | S:{r['score']:.2f} | "
-                f"P:${r['price']:.2f} | M6:{r['m6']:+.0%} | T:{r['trend']:.2f}"
-            )
+            msg.append(f"{r['ticker']} | S:{r['score']:.2f} | P:${r['price']:.2f}")
 
         text = "\n".join(msg)
 
@@ -240,7 +251,8 @@ class GrowthRadarV26_4_Plus:
             requests.post(WEBHOOK_URL, json={"content": text})
 
         print(text)
+        return text
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_4_Plus().run()
+    GrowthRadarV26_5().run()
