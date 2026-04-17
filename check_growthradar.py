@@ -9,245 +9,187 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-# =========================
-# CONFIG (v25.2 Discovery Mode)
-# =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 MAX_WORKERS = 12
 
 MIN_PRICE = 1.0
-MIN_MCAP = 5e7
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json"
 }
 
-class GrowthRadarV25_2:
+class GrowthRadarV25:
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
-        # ===== 観測ログ =====
-        self.stats = {
-            "total": 0,
-            "details_ok": 0,
-            "price_ok": 0,
-            "passed_filters": 0
-        }
-
-    # =========================
-    # UNIVERSE
-    # =========================
+    # -----------------------
+    # Universe
+    # -----------------------
     def load_universe(self):
         symbols = []
 
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
-            "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv",
-            "https://raw.githubusercontent.com/yannick-cw/stock-tickers/master/data/tickers.json"
+            "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
         ]
 
         print("Fetching universe...")
-
         for url in sources:
             try:
                 r = self.session.get(url, timeout=10)
-
-                if url.endswith(".txt"):
-                    found = [s.strip().upper() for s in r.text.split("\n") if s.strip()]
-
-                elif url.endswith(".csv"):
+                if "csv" in url:
                     df = pd.read_csv(url)
-                    found = df["Symbol"].dropna().astype(str).tolist()
-
+                    symbols.extend(df["Symbol"].dropna().tolist())
                 else:
-                    data = r.json()
-                    found = [item["symbol"] if isinstance(item, dict) else item for item in data]
-
-                symbols.extend(found)
-
+                    symbols.extend([s.strip() for s in r.text.split("\n") if s.strip()])
             except:
-                continue
+                pass
 
-        # クリーニング
-        symbols = list(set([
-            s for s in symbols
+        clean = list(set([
+            s.upper() for s in symbols
             if re.match(r"^[A-Z]{1,5}$", str(s))
         ]))
 
-        random.shuffle(symbols)
+        random.shuffle(clean)
+        print(f"Universe size: {len(clean)}")
+        return clean
 
-        print(f"Universe size: {len(symbols)}")
-        return symbols[:1500]
-
-    # =========================
-    # DETAILS
-    # =========================
-    def fetch_details(self, ticker):
+    # -----------------------
+    # Fetch
+    # -----------------------
+    def fetch(self, ticker):
         try:
-            url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-            r = self.session.get(url, timeout=5).json()
-            d = r["quoteResponse"]["result"][0]
-
-            return {
-                "mcap": d.get("marketCap", 0),
-                "name": d.get("longName", ""),
-                "type": d.get("quoteType", "")
-            }
-        except:
-            return None
-
-    def is_noise(self, name):
-        noise = ["WARRANT", "UNIT", "ACQUISITION", "RIGHT", "ETF"]
-        return any(k in name.upper() for k in noise)
-
-    # =========================
-    # ANALYZE
-    # =========================
-    def analyze(self, ticker):
-        self.stats["total"] += 1
-
-        try:
-            d = self.fetch_details(ticker)
-            if not d:
-                return None
-
-            self.stats["details_ok"] += 1
-
-            if d["type"] != "EQUITY":
-                return None
-
-            if self.is_noise(d["name"]):
-                return None
-
-            mcap = d["mcap"]
-            if not mcap or mcap < MIN_MCAP:
-                return None
-
-            # 価格データ
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
             r = self.session.get(url, timeout=5)
             j = r.json()["chart"]["result"][0]
 
             close = [c for c in j["indicators"]["quote"][0]["close"] if c is not None]
-            vol   = [v for v in j["indicators"]["quote"][0]["volume"] if v is not None]
+            vol = [v for v in j["indicators"]["quote"][0]["volume"] if v is not None]
 
-            if len(close) < 120:
+            if len(close) < 60:
                 return None
-
-            self.stats["price_ok"] += 1
 
             price = close[-1]
             if price < MIN_PRICE:
                 return None
 
-            # 指標
-            m1  = price / close[-21] - 1
-            m3  = price / close[-63] - 1
-            m12 = price / close[0] - 1
-
+            m1 = price / close[-21] - 1
+            m3 = price / close[-63] - 1 if len(close) > 63 else m1
             accel = m1 - m3
-            vol_ratio = (sum(vol[-5:])/5) / (sum(vol[-30:])/30 + 1e-9)
 
-            # ===== 緩和フィルタ =====
-            if m3 < 0.15:
-                return None
+            vol_ratio = (sum(vol[-5:]) / 5) / (sum(vol[-21:]) / 21 + 1e-9)
 
-            if accel < 0.03:
-                return None
-
-            if vol_ratio < 1.0:
-                return None
-
-            self.stats["passed_filters"] += 1
-
-            # スコア（ランキング用）
-            score = (
-                (m3 * 8) +
-                (accel * 25) +
-                (vol_ratio * 4)
-            )
+            # mcapは「使えたら使う」扱いに変更
+            mcap = 0
+            try:
+                durl = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+                d = self.session.get(durl, timeout=3).json()
+                mcap = d["quoteResponse"]["result"][0].get("marketCap", 0)
+            except:
+                pass
 
             return {
                 "ticker": ticker,
                 "price": price,
-                "mcap": mcap,
                 "m1": m1,
                 "m3": m3,
-                "m12": m12,
                 "accel": accel,
                 "vol": vol_ratio,
-                "score": score
+                "mcap": mcap
             }
 
         except:
             return None
 
-    # =========================
-    # RUN
-    # =========================
+    # -----------------------
+    # Run
+    # -----------------------
     def run(self):
         universe = self.load_universe()
+        batch = universe[:1500]
 
-        print(f"Scanning {len(universe)} symbols...")
+        print(f"Scanning {len(batch)} symbols...")
 
         results = []
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(self.analyze, t): t for t in universe}
-
+            futures = {ex.submit(self.fetch, t): t for t in batch}
             for f in as_completed(futures):
                 r = f.result()
                 if r:
                     results.append(r)
 
-        # ===== ログ =====
-        print("\n=== SCAN STATS ===")
-        print(f"Total:          {self.stats['total']}")
-        print(f"Details OK:     {self.stats['details_ok']}")
-        print(f"Price OK:       {self.stats['price_ok']}")
-        print(f"Passed Filters: {self.stats['passed_filters']}")
-        print("==================\n")
+        print(f"Valid results: {len(results)}")
 
         if not results:
-            self.output("No candidates.")
+            print("No data.")
             return
 
         df = pd.DataFrame(results)
-        df = df.sort_values("score", ascending=False).head(50)
 
-        self.report(df, len(universe), len(results))
+        # -----------------------
+        # Z-score
+        # -----------------------
+        for col in ["accel", "m1", "vol"]:
+            df[f"z_{col}"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
 
-    # =========================
-    # REPORT
-    # =========================
-    def report(self, df, total, valid):
-        now = datetime.now().strftime("%Y/%m/%d %H:%M")
+        # -----------------------
+        # Soft scoring
+        # -----------------------
+        df["score"] = (
+            df["z_accel"] * 0.5 +
+            df["z_m1"] * 0.3 +
+            df["z_vol"] * 0.2
+        )
+
+        # -----------------------
+        # Tenbagger bias (重要)
+        # -----------------------
+        df["bonus"] = 0
+
+        # 小型優遇
+        df.loc[(df["mcap"] > 0) & (df["mcap"] < 2e9), "bonus"] += 0.5
+
+        # 加速が明確
+        df.loc[df["accel"] > 0.3, "bonus"] += 0.5
+
+        # 初動ブレイク
+        df.loc[df["m1"] > 0.5, "bonus"] += 0.5
+
+        df["final_score"] = df["score"] + df["bonus"]
+
+        # -----------------------
+        # 出力（最低15件保証）
+        # -----------------------
+        top = df.sort_values("final_score", ascending=False).head(15)
+
+        self.report(top, len(batch), len(df))
+
+    def report(self, df, scanned, valid):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v25.2 Discovery",
-            f"Universe: {total} | Hits: {valid} | {now}\n"
+            f"🚀 GrowthRadar v25",
+            f"Scanned: {scanned} | Valid: {valid} | {now}\n"
         ]
 
         for r in df.to_dict("records"):
+            mc = f"{r['mcap']/1e9:.2f}B" if r["mcap"] > 0 else "N/A"
             msg.append(
-                f"{r['ticker']} | Score:{r['score']:.2f}\n"
-                f"Price:{r['price']:.2f} | MC:{r['mcap']/1e9:.2f}B\n"
-                f"M3:{r['m3']:.1%} | Accel:{r['accel']:.2f} | Vol:{r['vol']:.1f}x\n"
+                f"{r['ticker']} | Score:{r['final_score']:.2f}\n"
+                f"Price:{r['price']:.2f} | MC:{mc}\n"
+                f"M1:{r['m1']:+.1%} | Accel:{r['accel']:.2f} | Vol:{r['vol']:.1f}x\n"
             )
 
-        self.output("\n".join(msg))
+        text = "\n".join(msg)
 
-    def output(self, text):
         if WEBHOOK_URL:
-            try:
-                requests.post(WEBHOOK_URL, json={"content": text}, timeout=10)
-            except:
-                pass
-        print(text)
+            requests.post(WEBHOOK_URL, json={"content": text})
+        else:
+            print(text)
 
 
 if __name__ == "__main__":
-    GrowthRadarV25_2().run()
+    GrowthRadarV25().run()
