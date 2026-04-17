@@ -13,10 +13,8 @@ from datetime import datetime
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
-MAX_WORKERS = 10
 SCAN_SIZE = 2000
-
-STATE_FILE = "state_v2672.json"
+MAX_WORKERS = 10
 
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
@@ -24,44 +22,33 @@ MIN_AVG_VOL_VAL = 5e5
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-DISCORD_LIMIT = 1800
-
 # =========================
-# DISCORD SAFE SEND
+# METRICS HOLDER（重要）
+# =========================
+class Metrics:
+    def __init__(self):
+        self.universe_size = 0
+        self.scanned_size = 0
+        self.base_size = 0
+        self.tier1 = 0
+        self.tier2 = 0
+
 # =========================
 def send_discord(webhook_url, text):
     if not webhook_url:
-        print("[DISCORD] WEBHOOK missing")
+        print("[DISCORD] missing webhook")
         return
 
-    if not text:
-        print("[DISCORD] empty payload")
-        return
-
-    chunks = [text[i:i+DISCORD_LIMIT] for i in range(0, len(text), DISCORD_LIMIT)]
-
-    for i, chunk in enumerate(chunks):
+    chunks = [text[i:i+1800] for i in range(0, len(text), 1800)]
+    for c in chunks:
         try:
-            r = requests.post(webhook_url, json={"content": chunk}, timeout=10)
-            print(f"[DISCORD] chunk {i+1}/{len(chunks)} status={r.status_code} resp={r.text[:100]}")
+            r = requests.post(webhook_url, json={"content": c}, timeout=10)
+            print("[DISCORD]", r.status_code, r.text[:80])
         except Exception as e:
-            print(f"[DISCORD ERROR] {e}")
+            print("[DISCORD ERROR]", e)
 
 # =========================
-# STATE
-# =========================
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-# =========================
-class GrowthRadarV26_7_2:
+class GrowthRadarV26_8:
 
     def __init__(self):
         self.session = requests.Session()
@@ -70,6 +57,7 @@ class GrowthRadarV26_7_2:
     # =========================
     def load_universe(self):
         symbols = []
+
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
             "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv",
@@ -91,7 +79,7 @@ class GrowthRadarV26_7_2:
         ]))
 
         random.shuffle(clean)
-        return clean[:SCAN_SIZE]
+        return clean
 
     # =========================
     def fetch(self, ticker):
@@ -118,7 +106,7 @@ class GrowthRadarV26_7_2:
             m3 = price / close[-63] - 1
             m6 = price / close[-126] - 1
 
-            if np.isnan(m6) or m6 < 0.3:
+            if m6 < 0.3:
                 return None
 
             trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
@@ -151,53 +139,17 @@ class GrowthRadarV26_7_2:
         return df
 
     # =========================
-    def update_state(self, df, state):
-        now = datetime.now().strftime("%Y-%m-%d")
-
-        for _, r in df.iterrows():
-            t = r["ticker"]
-
-            if t not in state:
-                state[t] = {"history": []}
-
-            state[t]["history"].append({
-                "date": now,
-                "score": float(r["score"]),
-                "trend": float(r["trend"]),
-                "m6": float(r["m6"])
-            })
-
-            state[t]["history"] = state[t]["history"][-10:]
-
-        return state
-
-    # =========================
-    def build_state(self, state):
-        rows = []
-
-        for t, s in state.items():
-            hist = s.get("history", [])
-            if len(hist) == 0:
-                continue
-
-            scores = [h.get("score", 0) for h in hist]
-
-            if len(scores) == 0:
-                continue
-
-            rows.append({
-                "ticker": t,
-                "state_score": np.mean(scores) * 0.7 + np.max(scores) * 0.3,
-                "momentum": scores[-1] - scores[0] if len(scores) > 1 else 0
-            })
-
-        return pd.DataFrame(rows)
-
-    # =========================
     def run(self):
-        universe = self.load_universe()
-        batch = universe[:SCAN_SIZE]
+        m = Metrics()
 
+        # ===== ① Universe（母集団）=====
+        universe = self.load_universe()
+        m.universe_size = len(universe)
+
+        batch = universe[:SCAN_SIZE]
+        m.scanned_size = len(batch)
+
+        # ===== ② Fetch（生存データ）=====
         raw = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(self.fetch, t): t for t in batch}
@@ -206,73 +158,41 @@ class GrowthRadarV26_7_2:
                 if r:
                     raw.append(r)
 
-        if not raw:
+        m.base_size = len(raw)
+
+        if m.base_size == 0:
             print("NO DATA")
             return
 
+        # ===== ③ Score =====
         df = self.score(pd.DataFrame(raw))
 
-        # =========================
-        # STATE
-        # =========================
-        state = load_state()
-        state = self.update_state(df, state)
-        save_state(state)
+        df = df.sort_values("score", ascending=False)
 
-        state_df = self.build_state(state)
+        m.tier1 = len(df[df["score"] > 0.80])
+        m.tier2 = len(df[(df["score"] <= 0.80) & (df["score"] > 0.60)])
 
-        if state_df.empty:
-            state_df = pd.DataFrame(columns=["ticker", "state_score", "momentum"])
-
-        # =========================
-        # LIVE
-        # =========================
-        live = df.sort_values("score", ascending=False)
-
-        t1 = live[live["score"] > 0.80]
-        t2 = live[(live["score"] <= 0.80) & (live["score"] > 0.60)]
-
-        # =========================
-        # STATE
-        # =========================
-        state_top = state_df.sort_values("state_score", ascending=False)
-
-        # =========================
-        # MOMENTUM
-        # =========================
-        mom_top = state_df.sort_values("momentum", ascending=False)
-
-        # =========================
-        # REPORT
-        # =========================
+        # ===== ④ REPORT =====
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.7.2",
-            f"Live:{len(live)} State:{len(state_df)} {now}\n",
-            "🔥 LIVE Tier1"
+            "🚀 GrowthRadar v26.8 (Metrics Fixed)",
+            f"Scanned:{m.universe_size} | Base:{m.base_size} | Tier1:{m.tier1} | Tier2:{m.tier2} | {now}\n",
+            "🔥 Tier1"
         ]
 
-        for r in t1.head(8).to_dict("records"):
+        for r in df[df["score"] > 0.80].head(8).to_dict("records"):
             msg.append(f"{r['ticker']} S:{r['score']:.2f}")
 
-        msg.append("\n⚡ STATE")
-        for r in state_top.head(8).to_dict("records"):
-            msg.append(f"{r['ticker']} S:{r['state_score']:.2f}")
-
-        msg.append("\n🚀 MOMENTUM")
-        for r in mom_top.head(8).to_dict("records"):
-            msg.append(f"{r['ticker']} Δ:{r['momentum']:.2f}")
+        msg.append("\n👀 Tier2")
+        for r in df[(df["score"] <= 0.80) & (df["score"] > 0.60)].head(8).to_dict("records"):
+            msg.append(f"{r['ticker']} S:{r['score']:.2f}")
 
         text = "\n".join(msg)
 
         print(text)
-
-        # =========================
-        # DISCORD (FIXED)
-        # =========================
         send_discord(WEBHOOK_URL, text)
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_7_2().run()
+    GrowthRadarV26_8().run()
