@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIG
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-STATE_FILE = "growth_state_v32_4.json"
+STATE_FILE = "growth_state_v32_5.json"
 SCAN_SIZE = 1500
 MAX_WORKERS = 10
 MIN_PRICE = 2.0
@@ -110,7 +110,7 @@ def fetch(session, ticker):
         return None
 
 # =========================
-# DETECTOR（現実版）
+# DETECTOR（モメンタム版）
 # =========================
 def detect(state):
     early = []
@@ -118,45 +118,47 @@ def detect(state):
     expansion_strict = []
 
     for t, hist in state.data.items():
-        if len(hist) < 5:
+        if len(hist) < 3:
             continue
 
         scores = [h["s"] for h in hist]
         latest = scores[-1]
+        prev = scores[-2]
         avg = np.mean(scores)
-        growth = latest - scores[0]
+
+        momentum = latest - prev
 
         # -----------------
-        # EARLY（初動：とにかく拾う）
+        # EARLY（今上がってる）
         # -----------------
-        if growth > 0.04:
+        if momentum > 0.03:
             early.append({
                 "ticker": t,
                 "score": latest,
-                "growth": growth
+                "momentum": momentum
             })
 
         # -----------------
-        # EXPANSION（中核）
+        # EXPANSION（強い＋上昇）
         # -----------------
-        if latest > 0.70 and avg > 0.55 and growth > 0.03:
+        if latest > 0.65 and momentum > 0.02:
             expansion.append({
                 "ticker": t,
                 "score": latest,
-                "growth": growth
+                "momentum": momentum
             })
 
         # -----------------
-        # STRONG（本命）
+        # STRONG（高強度）
         # -----------------
-        if latest > 0.85 and avg > 0.65 and growth > 0.05:
+        if latest > 0.80 and avg > 0.60:
             expansion_strict.append({
                 "ticker": t,
                 "score": latest,
-                "growth": growth
+                "momentum": momentum
             })
 
-    early = sorted(early, key=lambda x: x["growth"], reverse=True)
+    early = sorted(early, key=lambda x: x["momentum"], reverse=True)
     expansion = sorted(expansion, key=lambda x: x["score"], reverse=True)
     expansion_strict = sorted(expansion_strict, key=lambda x: x["score"], reverse=True)
 
@@ -169,24 +171,24 @@ def report(early, expansion, expansion_strict, scanned, valid):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = [
-        f"🚀 GrowthRadar v32.4",
+        f"🚀 GrowthRadar v32.5",
         f"Scanned:{scanned} Valid:{valid}",
         f"EARLY:{len(early)} EXP:{len(expansion)} STRONG:{len(expansion_strict)}",
         f"Time:{now}",
         ""
     ]
 
-    msg.append("🔥 EARLY (初動)")
+    msg.append("🔥 EARLY (上昇検知)")
     for c in early[:10]:
-        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} M:{c['momentum']:.3f}")
 
-    msg.append("\n🚀 EXPANSION (中核)")
+    msg.append("\n🚀 EXPANSION (強い+上昇)")
     for c in expansion[:10]:
-        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} M:{c['momentum']:.3f}")
 
-    msg.append("\n💎 STRONG (本命)")
+    msg.append("\n💎 STRONG (高強度)")
     for c in expansion_strict[:5]:
-        msg.append(f"{c['ticker']} S:{c['score']:.2f} G:{c['growth']:.3f}")
+        msg.append(f"{c['ticker']} S:{c['score']:.2f} M:{c['momentum']:.3f}")
 
     text = "\n".join(msg)
     print(text)
@@ -221,11 +223,10 @@ def run():
         print("NO DATA")
         return
 
-    # スコアをランキング化（相対強度）
+    # 相対スコア化（維持）
     df = pd.DataFrame(raw)
     df["score"] = df["score"].rank(pct=True)
 
-    # state更新
     for _, r in df.iterrows():
         state.update(r["ticker"], r["score"])
 
